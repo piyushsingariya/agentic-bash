@@ -66,6 +66,32 @@ type PolicyViolation struct {
 	Blocked bool // true if the operation was prevented; false if only logged
 }
 
+// BootstrapConfig controls the synthetic Linux identity of the sandbox.
+// Zero values are replaced by defaults in sandbox.New().
+type BootstrapConfig struct {
+	UserName string // default "user"
+	Hostname string // default "sandbox"
+	UID      int    // default 1000
+	GID      int    // default 1000
+}
+
+// EnvironmentPreset controls how the initial shell environment is constructed.
+type EnvironmentPreset int
+
+const (
+	// EnvPresetLinux builds a clean synthetic Linux environment (default).
+	// The host process environment is NOT inherited. Variables in Options.Env
+	// are merged on top of the Linux base set.
+	EnvPresetLinux EnvironmentPreset = iota
+
+	// EnvPresetInheritHost inherits the full host process environment, then
+	// merges Options.Env on top. Matches the old default behaviour.
+	EnvPresetInheritHost
+
+	// EnvPresetEmpty starts with only Options.Env set; nothing else.
+	EnvPresetEmpty
+)
+
 // Options configures a Sandbox at creation time. All fields are optional;
 // zero values produce a working sandbox with sensible defaults.
 type Options struct {
@@ -73,13 +99,21 @@ type Options struct {
 	Limits    ResourceLimits
 	Network   NetworkPolicy
 
-	// Env is the initial set of environment variables visible to all Run() calls.
-	// Variables are merged into the subprocess environment; existing host env is
-	// not inherited unless explicitly included here.
+	// Bootstrap controls the synthetic Linux identity (username, hostname, etc.)
+	// used when EnvPreset is EnvPresetLinux (the default).
+	Bootstrap BootstrapConfig
+
+	// EnvPreset selects how the initial environment is built.
+	// Defaults to EnvPresetLinux.
+	EnvPreset EnvironmentPreset
+
+	// Env is merged on top of the preset environment. Use this to add or
+	// override individual variables without changing the preset.
 	Env map[string]string
 
 	// WorkDir is the starting working directory inside the sandbox.
-	// Defaults to the sandbox's own temp directory when empty.
+	// Defaults to /home/{Bootstrap.UserName} for EnvPresetLinux, or the
+	// sandbox temp directory for other presets.
 	WorkDir string
 
 	// BaseImageDir is the path to a pre-baked directory that forms the read-only

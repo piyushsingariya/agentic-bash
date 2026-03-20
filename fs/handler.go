@@ -6,21 +6,25 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"mvdan.cc/sh/v3/interp"
 )
 
 // NewOpenHandler returns an interp.OpenHandlerFunc-compatible function that
 // routes shell file I/O (redirections, here-docs) through sfs.
-// sandboxRoot is the absolute path the sandbox considers its root.
+// sandboxRoot is the absolute real path the sandbox uses as its root.
 //
 // Relative paths are resolved against the shell runner's working directory via
 // interp.HandlerCtx, matching the behaviour of mvdan.cc/sh's DefaultOpenHandler.
 //
 // Routing rules:
-//   - Paths within sandboxRoot  → always routed through sfs.
-//   - Paths outside sandboxRoot → reads fall through to the real OS filesystem;
-//     writes are rejected with stdfs.ErrPermission.
+//  1. Paths already within sandboxRoot → routed through sfs as-is.
+//  2. Device allowlist (/dev/null, /dev/urandom, /dev/random, /proc/self/fd/*) →
+//     passed through to the real OS filesystem.
+//  3. All other absolute paths → treated as virtual (e.g. /etc/hostname) and
+//     translated to their real counterpart under sandboxRoot. Writes go to sfs;
+//     reads also go to sfs (returning ENOENT if not bootstrapped).
 func NewOpenHandler(sfs SandboxFS, sandboxRoot string) func(ctx context.Context, path string, flag int, perm stdfs.FileMode) (io.ReadWriteCloser, error) {
 	root := filepath.Clean(sandboxRoot)
 
@@ -33,23 +37,35 @@ func NewOpenHandler(sfs SandboxFS, sandboxRoot string) func(ctx context.Context,
 		}
 		path = filepath.Clean(path)
 
+		// Already inside the sandbox root → route through sfs.
 		if containedBy(root, path) {
 			return sfs.OpenFile(path, flag, perm)
 		}
 
-		// /dev/null is always allowed regardless of direction.
-		if path == "/dev/null" {
+		// Device/proc allowlist: always pass through to the real OS.
+		if isHostPassthrough(path) {
 			return os.OpenFile(path, flag, perm)
 		}
 
-		// Paths outside the sandbox root: writes are blocked, reads fall through.
-		if isWriteFlag(flag) {
-			// Return *os.PathError so mvdan.cc/sh treats it as a non-fatal redirect
-			// error (prints to stderr) rather than aborting the whole script.
-			return nil, &os.PathError{Op: "open", Path: path, Err: stdfs.ErrPermission}
-		}
-
-		// Allow reads from the host filesystem (e.g. /etc/hostname, /usr/share/…).
-		return os.OpenFile(path, flag, perm)
+		// All other absolute paths are virtual (e.g. /etc/hostname, /workspace).
+		// Translate to the real on-disk path and route through sfs.
+		// This prevents cat /etc/hostname returning the real hostname, and makes
+		// writes to virtual paths land inside the sandbox.
+		realPath := filepath.Join(root, path)
+		return sfs.OpenFile(realPath, flag, perm)
 	}
+}
+
+// isHostPassthrough returns true for paths that must be served from the real
+// host filesystem regardless of virtual path translation.
+func isHostPassthrough(path string) bool {
+	switch path {
+	case "/dev/null", "/dev/urandom", "/dev/random", "/dev/zero":
+		return true
+	}
+	// /proc/self/fd/* is needed by some Go stdlib operations.
+	if strings.HasPrefix(path, "/proc/self/fd/") {
+		return true
+	}
+	return false
 }

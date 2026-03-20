@@ -38,25 +38,49 @@ type ShellState struct {
 
 // newShellState builds the initial ShellState from the provided Options.
 //
-// Environment initialisation rules:
-//   - opts.Env == nil  → inherit the host process environment. This ensures
-//     PATH and other system variables are available so external commands work
-//     without any extra configuration.
-//   - opts.Env != nil  → use exactly the supplied map (empty map = empty env).
+// Environment initialisation rules depend on opts.EnvPreset:
+//   - EnvPresetLinux (default): clean synthetic Linux env; host env not inherited.
+//   - EnvPresetInheritHost: full host process environment is inherited.
+//   - EnvPresetEmpty: only opts.Env is set; nothing else.
+//
+// opts.Env is merged on top of the preset in all cases.
 func newShellState(opts Options) *ShellState {
 	var env map[string]string
-	if opts.Env == nil {
+	switch opts.EnvPreset {
+	case EnvPresetInheritHost:
 		env = hostEnvMap()
-	} else {
-		env = make(map[string]string, len(opts.Env))
-		for k, v := range opts.Env {
-			env[k] = v
-		}
+	case EnvPresetEmpty:
+		env = make(map[string]string)
+	default: // EnvPresetLinux
+		env = linuxBaseEnv(opts.Bootstrap, opts.WorkDir)
+	}
+	// Caller-supplied vars override the preset.
+	for k, v := range opts.Env {
+		env[k] = v
 	}
 	return &ShellState{
 		Env:       env,
 		Cwd:       opts.WorkDir,
 		Functions: make(map[string]string),
+	}
+}
+
+// linuxBaseEnv returns a clean synthetic Linux environment for the sandbox.
+// No host variables are inherited.
+func linuxBaseEnv(cfg BootstrapConfig, workDir string) map[string]string {
+	return map[string]string{
+		"HOME":     "/home/" + cfg.UserName,
+		"USER":     cfg.UserName,
+		"LOGNAME":  cfg.UserName,
+		"HOSTNAME": cfg.Hostname,
+		"SHELL":    "/bin/bash",
+		"TERM":     "xterm-256color",
+		"LANG":     "en_US.UTF-8",
+		"LC_ALL":   "en_US.UTF-8",
+		"PATH":     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"PWD":      workDir,
+		"OLDPWD":   workDir,
+		"TMPDIR":   "/tmp",
 	}
 }
 

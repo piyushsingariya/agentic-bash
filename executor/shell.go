@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 
 	"github.com/piyushsingariya/agentic-bash/internal/limitwriter"
+	"github.com/piyushsingariya/agentic-bash/internal/pathmap"
 )
 
 // ExecHandlerFunc is an alias for interp.ExecHandlerFunc. Provided so callers
@@ -63,6 +65,12 @@ type ShellExecutor struct {
 
 	// outputLimitBytes caps combined stdout+stderr per Run(); 0 = no cap.
 	outputLimitBytes int64
+
+	// sandboxRoot is the real on-disk temp directory. When non-empty, virtual
+	// path translation is active: PWD is forced to the virtual path in env,
+	// ExtractState returns the virtual cwd, and a cd() override is injected
+	// into the preamble so that `cd /workspace` resolves inside the sandbox.
+	sandboxRoot string
 }
 
 // NewShellExecutor creates a ShellExecutor initialised with the given
@@ -96,6 +104,13 @@ func (e *ShellExecutor) WithOpenHandler(h OpenHandlerFunc) {
 // stopping execution cleanly.  Zero disables the cap.
 func (e *ShellExecutor) WithOutputLimit(maxBytes int64) {
 	e.outputLimitBytes = maxBytes
+}
+
+// WithSandboxRoot enables virtual path translation. root is the real on-disk
+// temp directory. The shell's dir is expected to be a real path under root,
+// but $PWD and the cwd returned by ExtractState will be the virtual path.
+func (e *ShellExecutor) WithSandboxRoot(root string) {
+	e.sandboxRoot = root
 }
 
 // Run implements Executor. The env and dir parameters are ignored; the
@@ -184,6 +199,8 @@ func (e *ShellExecutor) runCore(ctx context.Context, cmd string, outW, errW io.W
 
 // ExtractState implements StateExtractor.
 // It returns the current exported environment and working directory.
+// When sandboxRoot is set, the returned cwd is the virtual path (e.g. /home/user)
+// rather than the real on-disk path.
 func (e *ShellExecutor) ExtractState() (env map[string]string, cwd string) {
 	exported := make(map[string]string)
 
@@ -206,19 +223,28 @@ func (e *ShellExecutor) ExtractState() (env map[string]string, cwd string) {
 		}
 	}
 
-	return exported, e.dir
+	cwd = e.dir
+	if e.sandboxRoot != "" {
+		cwd = pathmap.RealToVirtual(e.sandboxRoot, e.dir)
+	}
+	return exported, cwd
 }
 
 // ResetState implements StateExtractor.
 // It discards all accumulated session state and reinitialises to the given env/cwd.
+// cwd may be a virtual path; when sandboxRoot is set it is translated to real.
 func (e *ShellExecutor) ResetState(env map[string]string, cwd string) error {
 	pairs := make([]string, 0, len(env))
 	for k, v := range env {
 		pairs = append(pairs, k+"="+v)
 	}
 	e.baseEnv = pairs
-	e.initDir = cwd
-	e.dir = cwd
+	realCwd := cwd
+	if e.sandboxRoot != "" {
+		realCwd = pathmap.VirtualToReal(e.sandboxRoot, cwd)
+	}
+	e.initDir = realCwd
+	e.dir = realCwd
 	e.vars = make(map[string]expand.Variable)
 	e.funcs = make(map[string]*syntax.Stmt)
 	return nil
@@ -226,6 +252,8 @@ func (e *ShellExecutor) ResetState(env map[string]string, cwd string) error {
 
 // effectiveEnv returns the merged KEY=VALUE slice that will be passed to the
 // next runner: base env overridden by any exported vars accumulated so far.
+// When sandboxRoot is set, PWD is forced to the virtual path so that $PWD
+// always shows the agent-visible path rather than the real tmpdir path.
 func (e *ShellExecutor) effectiveEnv() []string {
 	m := make(map[string]string)
 
@@ -242,6 +270,11 @@ func (e *ShellExecutor) effectiveEnv() []string {
 		}
 	}
 
+	// Force PWD to the virtual path so $PWD looks right inside the sandbox.
+	if e.sandboxRoot != "" {
+		m["PWD"] = pathmap.RealToVirtual(e.sandboxRoot, e.dir)
+	}
+
 	out := make([]string, 0, len(m))
 	for k, v := range m {
 		out = append(out, k+"="+v)
@@ -252,17 +285,35 @@ func (e *ShellExecutor) effectiveEnv() []string {
 // buildPreamble constructs the shell source that re-establishes session state
 // at the top of each Run() call:
 //
-//  1. Non-exported local variables (re-assigned verbatim).
-//  2. Shell function definitions (printed from their AST nodes).
+//  1. A cd() override (when sandboxRoot is set) that translates virtual absolute
+//     paths to real on-disk paths, giving the agent a Linux-feel `cd`.
+//  2. Non-exported local variables (re-assigned verbatim).
+//  3. Shell function definitions (printed from their AST nodes).
 //
 // Exported variables are instead injected via interp.Env() so they are
 // visible to subprocesses; they do not need to appear in the preamble.
 func (e *ShellExecutor) buildPreamble() string {
-	if len(e.vars) == 0 && len(e.funcs) == 0 {
-		return ""
-	}
-
 	var buf strings.Builder
+
+	// Inject a cd() shim that makes `cd /virtual/path` work inside the sandbox
+	// by prepending the real sandbox root before calling the builtin cd, then
+	// updating $PWD to the virtual path so the agent always sees clean paths.
+	if e.sandboxRoot != "" {
+		root := e.sandboxRoot
+		// single-quote the root so no shell expansion occurs; MkdirTemp paths
+		// never contain single quotes.
+		fmt.Fprintf(&buf,
+			"cd() {\n"+
+				"  local _prev=\"${PWD}\" _t=\"${1:-${HOME}}\"\n"+
+				"  case \"${_t}\" in\n"+
+				"    -)   command cd '%s'\"${OLDPWD}\" || return $?; local _tmp=\"${PWD}\"; export PWD=\"${OLDPWD}\"; export OLDPWD=\"${_tmp}\" ;;\n"+
+				"    /*)  command cd '%s'\"${_t}\" || return $?; export OLDPWD=\"${_prev}\"; export PWD=\"${_t}\" ;;\n"+
+				"    *)   command cd \"${_t}\" || return $?; local _real; _real=$(command pwd); _real=\"${_real#'%s'}\"; export OLDPWD=\"${_prev}\"; export PWD=\"${_real:-/}\" ;;\n"+
+				"  esac\n"+
+				"}\n",
+			root, root, root,
+		)
+	}
 
 	// Non-exported, non-read-only local variables.
 	// ReadOnly variables (e.g. UID, EUID, GID) must be skipped: in a
@@ -307,7 +358,19 @@ func (e *ShellExecutor) syncFrom(r *interp.Runner) {
 
 	// Replace function table with the runner's final view. This naturally
 	// handles both newly-defined and deleted functions (unset -f).
-	e.funcs = r.Funcs
+	// The injected cd() shim is excluded: it is always rebuilt in buildPreamble
+	// so we don't want it persisted (and possibly double-emitted) via e.funcs.
+	if e.sandboxRoot != "" {
+		e.funcs = make(map[string]*syntax.Stmt, len(r.Funcs))
+		for name, stmt := range r.Funcs {
+			if name == "cd" {
+				continue
+			}
+			e.funcs[name] = stmt
+		}
+	} else {
+		e.funcs = r.Funcs
+	}
 }
 
 // resolveExitCode converts a runner.Run() error into an integer exit code.

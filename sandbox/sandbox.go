@@ -13,6 +13,7 @@ import (
 	"github.com/piyushsingariya/agentic-bash/executor"
 	sbfs "github.com/piyushsingariya/agentic-bash/fs"
 	"github.com/piyushsingariya/agentic-bash/internal/cgroups"
+	"github.com/piyushsingariya/agentic-bash/internal/pathmap"
 	"github.com/piyushsingariya/agentic-bash/isolation"
 	"github.com/piyushsingariya/agentic-bash/network"
 	"github.com/piyushsingariya/agentic-bash/packages"
@@ -24,7 +25,8 @@ const DefaultTimeout = 30 * time.Second
 // Sandbox is the main entry point. It provides a stateful, isolated execution
 // environment for AI agents. Each Run() call shares the same shell state
 // (environment variables, working directory) as previous calls within the
-// same Sandbox, matching the stateful session model of just-bash.
+// same Sandbox. Unlike just-bash, which resets all state (env, cwd, functions)
+// after every exec(), agentic-bash deliberately persists state across Run() calls.
 //
 // The default executor is ShellExecutor (mvdan.cc/sh pure Go interpreter).
 // NativeExecutor (Phase 1 /bin/sh subprocess) is retained as a fallback and
@@ -57,14 +59,38 @@ func New(opts Options) (*Sandbox, error) {
 		return nil, fmt.Errorf("sandbox: create temp dir: %w", err)
 	}
 
-	// Default the working directory to the sandbox's own temp dir so commands
-	// have a safe, writable home without touching the host filesystem.
-	if opts.WorkDir == "" {
-		opts.WorkDir = tmpDir
+	// Apply BootstrapConfig defaults.
+	if opts.Bootstrap.UserName == "" {
+		opts.Bootstrap.UserName = "user"
+	}
+	if opts.Bootstrap.Hostname == "" {
+		opts.Bootstrap.Hostname = "sandbox"
+	}
+	if opts.Bootstrap.UID == 0 {
+		opts.Bootstrap.UID = 1000
+	}
+	if opts.Bootstrap.GID == 0 {
+		opts.Bootstrap.GID = 1000
 	}
 
-	// Ensure the configured WorkDir actually exists.
-	if err := os.MkdirAll(opts.WorkDir, 0o755); err != nil {
+	// Always bootstrap the Linux skeleton so virtual paths (etc, home, …) exist.
+	if err := bootstrapFS(tmpDir, opts.Bootstrap); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("sandbox: bootstrap fs: %w", err)
+	}
+
+	// Default WorkDir: virtual home for the Linux preset, real tmpDir otherwise.
+	if opts.WorkDir == "" {
+		if opts.EnvPreset == EnvPresetLinux {
+			opts.WorkDir = "/home/" + opts.Bootstrap.UserName
+		} else {
+			opts.WorkDir = tmpDir
+		}
+	}
+
+	// Ensure the real counterpart of WorkDir exists on disk.
+	realWorkDir := pathmap.VirtualToReal(tmpDir, opts.WorkDir)
+	if err := os.MkdirAll(realWorkDir, 0o755); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("sandbox: create work dir %q: %w", opts.WorkDir, err)
 	}
@@ -82,7 +108,9 @@ func New(opts Options) (*Sandbox, error) {
 
 	// Phase 2: ShellExecutor is the default — pure Go shell, state managed
 	// in-process, no temp-file captures needed.
-	shellExec := executor.NewShellExecutor(state.EnvSlice(), state.Cwd)
+	// Pass the real initial dir; the virtual path is handled via sandboxRoot.
+	shellExec := executor.NewShellExecutor(state.EnvSlice(), realWorkDir)
+	shellExec.WithSandboxRoot(tmpDir)
 
 	// Phase 4: select isolation strategy and wire a custom ExecHandler so that
 	// every external command spawned by the shell runs with isolation applied.
@@ -314,7 +342,17 @@ func (s *Sandbox) wireHandlers() {
 		Manifest:    s.manifest,
 		CacheDir:    packages.DefaultCacheDir(),
 	}
-	shellExec.WithExecHandler(packages.NewShimHandler(shimCfg, isoHandler))
+	shimHandler := packages.NewShimHandler(shimCfg, isoHandler)
+	// Process-info handler sits outermost so whoami/hostname/id/uname/ls are
+	// answered with virtual values before reaching the shim or isolation layers.
+	piCfg := executor.ProcessInfoConfig{
+		UserName:    s.opts.Bootstrap.UserName,
+		Hostname:    s.opts.Bootstrap.Hostname,
+		UID:         s.opts.Bootstrap.UID,
+		GID:         s.opts.Bootstrap.GID,
+		SandboxRoot: s.tempDir,
+	}
+	shellExec.WithExecHandler(executor.NewProcessInfoHandler(piCfg, shimHandler))
 }
 
 // Reset restores the sandbox to its initial Options state.
@@ -329,6 +367,7 @@ func (s *Sandbox) Reset() {
 	s.tracker.Reset()
 
 	if se, ok := s.exec.(executor.StateExtractor); ok {
+		// ResetState translates virtual cwd → real internally when sandboxRoot is set.
 		_ = se.ResetState(s.state.Env, s.state.Cwd)
 	}
 	s.metrics = &isolation.ExecMetrics{}
@@ -538,14 +577,15 @@ func (s *Sandbox) DownloadTar(w io.Writer) error {
 	return tw.Close()
 }
 
-// resolvePath converts a user-supplied path to an absolute path.
+// resolvePath converts a user-supplied path to the real on-disk path.
 // Relative paths are resolved against the current working directory.
-// Absolute paths are passed through as-is (OsFS enforces containment).
+// Virtual absolute paths (e.g. /home/user/foo) are translated to their real
+// counterparts under the sandbox temp directory.
 func (s *Sandbox) resolvePath(path string) string {
-	if filepath.IsAbs(path) {
-		return path
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(s.state.Cwd, path)
 	}
-	return filepath.Join(s.state.Cwd, path)
+	return pathmap.VirtualToReal(s.tempDir, path)
 }
 
 // buildWrappedCommand constructs a /bin/sh script used by NativeExecutor to
