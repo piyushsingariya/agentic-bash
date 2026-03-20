@@ -1,8 +1,10 @@
 package sandbox
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,8 @@ import (
 	sbfs "github.com/piyushsingariya/agentic-bash/fs"
 	"github.com/piyushsingariya/agentic-bash/internal/cgroups"
 	"github.com/piyushsingariya/agentic-bash/isolation"
+	"github.com/piyushsingariya/agentic-bash/network"
+	"github.com/piyushsingariya/agentic-bash/packages"
 )
 
 // DefaultTimeout is applied when Options.Limits.Timeout is zero.
@@ -34,6 +38,7 @@ type Sandbox struct {
 	isolation isolation.IsolationStrategy
 	cgroupMgr cgroups.Manager        // Phase 5: per-sandbox cgroup factory
 	metrics   *isolation.ExecMetrics // Phase 5: reset each Run(); read after
+	manifest  *packages.Manifest     // Phase 6: tracks installed packages
 	tempDir   string                 // owned exclusively; removed on Close()
 	closed    bool
 	ctx       context.Context    // base context; replaced via SetContext
@@ -69,6 +74,7 @@ func New(opts Options) (*Sandbox, error) {
 	}
 
 	state := newShellState(opts)
+	injectOverlayEnv(state, tmpDir)
 
 	// Phase 3: layered in-memory filesystem with optional read-only base layer.
 	lfs := sbfs.NewLayeredFS(tmpDir, opts.BaseImageDir)
@@ -94,6 +100,7 @@ func New(opts Options) (*Sandbox, error) {
 		tempDir:   tmpDir,
 		cgroupMgr: cgroups.NewManager(), // Phase 5: no-op on non-Linux
 		metrics:   &isolation.ExecMetrics{},
+		manifest:  packages.NewManifest(), // Phase 6
 		ctx:       baseCtx,
 		cancelCtx: cancelCtx,
 	}
@@ -244,6 +251,31 @@ func (s *Sandbox) State() *ShellState {
 	return s.state
 }
 
+// Manifest returns the sandbox's package manifest, which tracks all packages
+// installed via pip or apt during this sandbox session.
+func (s *Sandbox) Manifest() *packages.Manifest {
+	return s.manifest
+}
+
+// injectOverlayEnv prepends the overlay's Python site-packages dir to
+// PYTHONPATH and the overlay's bin dir to PATH so that packages installed
+// inside the sandbox are immediately importable / executable.
+func injectOverlayEnv(state *ShellState, overlayRoot string) {
+	pythonPath := packages.OverlayPythonPath(overlayRoot)
+	if existing := state.Env["PYTHONPATH"]; existing != "" {
+		state.Env["PYTHONPATH"] = pythonPath + ":" + existing
+	} else {
+		state.Env["PYTHONPATH"] = pythonPath
+	}
+
+	binPath := packages.OverlayBinPath(overlayRoot)
+	if existing := state.Env["PATH"]; existing != "" {
+		state.Env["PATH"] = binPath + ":" + existing
+	} else {
+		state.Env["PATH"] = binPath
+	}
+}
+
 // wireHandlers re-wires the exec handler to capture the current metrics
 // pointer.  Called from New() (after the open handler is set once) and the
 // start of each Run() so that a fresh *ExecMetrics is captured by the closure.
@@ -258,13 +290,31 @@ func (s *Sandbox) wireHandlers() {
 		shellExec.WithOutputLimit(int64(s.opts.Limits.MaxOutputMB) * 1024 * 1024)
 	}
 
+	// Phase 7: select network filter based on sandbox network policy.
+	var netFilter network.Filter
+	switch s.opts.Network.Mode {
+	case NetworkDeny:
+		netFilter = network.NewDeny()
+	case NetworkAllowlist:
+		netFilter = network.NewAllowlist(s.opts.Network.Allowlist)
+	default:
+		netFilter = network.NewAllow()
+	}
+
 	limits := isolation.ExecLimits{
 		MaxOutputBytes: int64(s.opts.Limits.MaxOutputMB) * 1024 * 1024,
 		CgroupManager:  s.cgroupMgr,
 		MaxMemoryBytes: int64(s.opts.Limits.MaxMemoryMB) * 1024 * 1024,
 		CPUQuota:       s.opts.Limits.MaxCPUPercent / 100.0,
+		NetworkFilter:  netFilter,
 	}
-	shellExec.WithExecHandler(isolation.NewIsolatedExecHandler(s.isolation, limits, s.metrics))
+	isoHandler := isolation.NewIsolatedExecHandler(s.isolation, limits, s.metrics)
+	shimCfg := packages.ShimConfig{
+		OverlayRoot: s.tempDir,
+		Manifest:    s.manifest,
+		CacheDir:    packages.DefaultCacheDir(),
+	}
+	shellExec.WithExecHandler(packages.NewShimHandler(shimCfg, isoHandler))
 }
 
 // Reset restores the sandbox to its initial Options state.
@@ -272,6 +322,7 @@ func (s *Sandbox) wireHandlers() {
 // previous Run() calls are discarded.
 func (s *Sandbox) Reset() {
 	s.state = newShellState(s.opts)
+	injectOverlayEnv(s.state, s.tempDir)
 
 	// Clear files created during previous runs; keep the root directory.
 	_ = s.fs.Clear()
@@ -281,6 +332,7 @@ func (s *Sandbox) Reset() {
 		_ = se.ResetState(s.state.Env, s.state.Cwd)
 	}
 	s.metrics = &isolation.ExecMetrics{}
+	s.manifest = packages.NewManifest()
 	s.wireHandlers()
 }
 
@@ -296,6 +348,204 @@ func (s *Sandbox) Close() error {
 		s.cancelCtx()
 	}
 	return os.RemoveAll(s.tempDir)
+}
+
+// RunStream executes cmd inside the sandbox and writes stdout/stderr to the
+// provided writers in real time as the process produces output.
+// Returns the exit code and any infrastructure error (timeout, closed, etc.).
+func (s *Sandbox) RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) (int, error) {
+	if s.closed {
+		return 1, fmt.Errorf("sandbox is closed")
+	}
+	if s.opts.OnCommand != nil {
+		s.opts.OnCommand(cmd)
+	}
+
+	s.tracker.Reset()
+	s.metrics = &isolation.ExecMetrics{}
+	s.wireHandlers()
+
+	merged, mergedCancel := context.WithCancel(ctx)
+	defer mergedCancel()
+	go func() {
+		select {
+		case <-s.ctx.Done():
+			mergedCancel()
+		case <-merged.Done():
+		}
+	}()
+
+	start := time.Now()
+	runCtx, runCancel := context.WithTimeout(merged, s.opts.Limits.Timeout)
+	defer runCancel()
+
+	var exitCode int
+	var runErr error
+
+	if se, ok := s.exec.(*executor.ShellExecutor); ok {
+		exitCode, runErr = se.RunToWriters(runCtx, cmd, stdout, stderr)
+		env, cwd := se.ExtractState()
+		s.state.Env = env
+		s.state.Cwd = cwd
+	} else {
+		// NativeExecutor fallback: buffer then copy.
+		res := s.exec.Run(runCtx, cmd, s.state.EnvSlice(), s.state.Cwd)
+		_, _ = io.WriteString(stdout, res.Stdout)
+		_, _ = io.WriteString(stderr, res.Stderr)
+		exitCode = res.ExitCode
+		runErr = res.Error
+	}
+
+	s.state.History = append(s.state.History, cmd)
+
+	if s.opts.OnResult != nil {
+		s.opts.OnResult(ExecutionResult{
+			ExitCode:      exitCode,
+			Duration:      time.Since(start),
+			Error:         runErr,
+			FilesCreated:  s.tracker.FilesCreated(),
+			FilesModified: s.tracker.FilesModified(),
+			FilesDeleted:  s.tracker.FilesDeleted(),
+			CPUTime:       time.Duration(s.metrics.CPUUsec) * time.Microsecond,
+			MemoryPeakMB:  int(s.metrics.MemPeakBytes / (1024 * 1024)),
+		})
+	}
+
+	return exitCode, runErr
+}
+
+// WriteFile writes data to path inside the sandbox filesystem.
+// Relative paths are resolved against the current working directory.
+func (s *Sandbox) WriteFile(path string, data []byte) error {
+	return s.fs.WriteFile(s.resolvePath(path), data, 0o644)
+}
+
+// ReadFile reads and returns the contents of path inside the sandbox filesystem.
+// Relative paths are resolved against the current working directory.
+func (s *Sandbox) ReadFile(path string) ([]byte, error) {
+	return s.fs.ReadFile(s.resolvePath(path))
+}
+
+// ListFiles returns the entries of dir inside the sandbox filesystem.
+// Relative paths are resolved against the current working directory.
+func (s *Sandbox) ListFiles(dir string) ([]FileInfo, error) {
+	abs := s.resolvePath(dir)
+	entries, err := s.fs.ReadDir(abs)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]FileInfo, 0, len(entries))
+	for _, e := range entries {
+		fi, fiErr := e.Info()
+		if fiErr != nil {
+			continue
+		}
+		infos = append(infos, FileInfo{
+			Name:    e.Name(),
+			Path:    filepath.Join(abs, e.Name()),
+			Size:    fi.Size(),
+			Mode:    fi.Mode(),
+			ModTime: fi.ModTime(),
+			IsDir:   e.IsDir(),
+		})
+	}
+	return infos, nil
+}
+
+// UploadTar extracts a tar archive from r into the sandbox filesystem.
+// Existing files are overwritten; the sandbox root is not wiped first.
+// Path traversal attempts (entries escaping the sandbox root) are rejected.
+func (s *Sandbox) UploadTar(r io.Reader) error {
+	root := s.fs.Root()
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("upload tar: read header: %w", err)
+		}
+		target := filepath.Join(root, filepath.Clean("/"+hdr.Name))
+		if !strings.HasPrefix(target, root+string(filepath.Separator)) && target != root {
+			return fmt.Errorf("upload tar: path escapes sandbox root: %s", hdr.Name)
+		}
+		info := hdr.FileInfo()
+		if info.IsDir() {
+			if err := os.MkdirAll(target, info.Mode()); err != nil {
+				return fmt.Errorf("upload tar: mkdir %s: %w", hdr.Name, err)
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return fmt.Errorf("upload tar: mkdir parent %s: %w", hdr.Name, err)
+		}
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+		if err != nil {
+			return fmt.Errorf("upload tar: create %s: %w", hdr.Name, err)
+		}
+		if _, err := io.Copy(f, tr); err != nil {
+			f.Close()
+			return fmt.Errorf("upload tar: write %s: %w", hdr.Name, err)
+		}
+		f.Close()
+	}
+	return nil
+}
+
+// DownloadTar writes a tar archive of the sandbox filesystem to w.
+// The archive paths are relative to the sandbox root.
+func (s *Sandbox) DownloadTar(w io.Writer) error {
+	root := s.fs.Root()
+	tw := tar.NewWriter(w)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		if rel == "." {
+			return nil
+		}
+		hdr, hdrErr := tar.FileInfoHeader(info, "")
+		if hdrErr != nil {
+			return fmt.Errorf("download tar: header for %s: %w", rel, hdrErr)
+		}
+		hdr.Name = rel
+		if info.IsDir() {
+			hdr.Name += "/"
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return fmt.Errorf("download tar: write header %s: %w", rel, err)
+		}
+		if !info.IsDir() {
+			f, openErr := os.Open(path)
+			if openErr != nil {
+				return fmt.Errorf("download tar: open %s: %w", rel, openErr)
+			}
+			defer f.Close()
+			if _, copyErr := io.Copy(tw, f); copyErr != nil {
+				return fmt.Errorf("download tar: copy %s: %w", rel, copyErr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return tw.Close()
+}
+
+// resolvePath converts a user-supplied path to an absolute path.
+// Relative paths are resolved against the current working directory.
+// Absolute paths are passed through as-is (OsFS enforces containment).
+func (s *Sandbox) resolvePath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(s.state.Cwd, path)
 }
 
 // buildWrappedCommand constructs a /bin/sh script used by NativeExecutor to

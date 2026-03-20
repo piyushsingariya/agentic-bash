@@ -102,8 +102,28 @@ func (e *ShellExecutor) WithOutputLimit(maxBytes int64) {
 // executor manages state internally. Call ExtractState() to read updated
 // state after Run() returns.
 func (e *ShellExecutor) Run(ctx context.Context, cmd string, _ []string, _ string) Result {
+	var stdout, stderr bytes.Buffer
+	exitCode, retErr := e.runCore(ctx, cmd, &stdout, &stderr)
+	return Result{
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+		ExitCode: exitCode,
+		Error:    retErr,
+	}
+}
+
+// RunToWriters executes cmd, writing stdout and stderr directly to the
+// provided writers instead of buffering. Used by sandbox.RunStream to
+// deliver output incrementally as the process produces it.
+func (e *ShellExecutor) RunToWriters(ctx context.Context, cmd string, outW, errW io.Writer) (int, error) {
+	return e.runCore(ctx, cmd, outW, errW)
+}
+
+// runCore is the shared implementation for Run and RunToWriters.
+// It parses and executes cmd, writing output to outW and errW.
+func (e *ShellExecutor) runCore(ctx context.Context, cmd string, outW, errW io.Writer) (int, error) {
 	if strings.TrimSpace(cmd) == "" {
-		return Result{}
+		return 0, nil
 	}
 
 	// Build the full script: function preamble + user command.
@@ -111,23 +131,17 @@ func (e *ShellExecutor) Run(ctx context.Context, cmd string, _ []string, _ strin
 
 	f, err := e.parser.Parse(strings.NewReader(fullCmd), "input")
 	if err != nil {
-		return Result{
-			Stderr:   "shell parse error: " + err.Error(),
-			ExitCode: 1,
-			Error:    err,
-		}
+		_, _ = io.WriteString(errW, "shell parse error: "+err.Error())
+		return 1, err
 	}
 
-	var stdout, stderr bytes.Buffer
-
-	// Output cap: wrap buffers with limit writers that cancel the runner
+	// Output cap: wrap writers with limit writers that cancel the runner
 	// context when the combined byte count exceeds the cap.
 	runCtx := ctx
-	var outW, errW io.Writer = &stdout, &stderr
 	if e.outputLimitBytes > 0 {
 		cancelCtx, cancel := context.WithCancel(ctx)
 		runCtx = cancelCtx
-		outW, errW = limitwriter.NewPair(&stdout, &stderr, e.outputLimitBytes, cancel)
+		outW, errW = limitwriter.NewPair(outW, errW, e.outputLimitBytes, cancel)
 	}
 
 	opts := []interp.RunnerOption{
@@ -146,7 +160,8 @@ func (e *ShellExecutor) Run(ctx context.Context, cmd string, _ []string, _ strin
 
 	runner, err := interp.New(opts...)
 	if err != nil {
-		return Result{Stderr: err.Error(), ExitCode: 1, Error: err}
+		_, _ = io.WriteString(errW, err.Error())
+		return 1, err
 	}
 
 	runErr := runner.Run(runCtx, f)
@@ -164,12 +179,7 @@ func (e *ShellExecutor) Run(ctx context.Context, cmd string, _ []string, _ strin
 		}
 	}
 
-	return Result{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: exitCode,
-		Error:    retErr,
-	}
+	return exitCode, retErr
 }
 
 // ExtractState implements StateExtractor.

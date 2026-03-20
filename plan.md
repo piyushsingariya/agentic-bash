@@ -692,3 +692,62 @@ Phases 4, 5, 6, and 7 can be developed in parallel once Phase 3 is complete.
 - `SandboxPool.Acquire()` returns a warm sandbox in < 5ms (after pool is pre-warmed)
 - The library compiles and all unit tests pass on macOS without any build errors or panics
 - The library has no CGO dependencies in the core path
+
+---
+
+## Gap Analysis vs vercel-labs/just-bash
+
+Evaluated against [vercel-labs/just-bash](https://github.com/vercel-labs/just-bash) (TypeScript virtual bash environment for AI agents) on 2026-03-20.
+
+---
+
+### 1. Features in just-bash not planned in agentic-bash
+
+| Feature | just-bash | agentic-bash | Notes |
+|---|---|---|---|
+| **Custom commands API** | `defineCommand()`, `customCommands`, `registerCommand()` — inject arbitrary built-ins | No plugin/extension API | Useful for AI agents that need tool-specific commands |
+| **Restrict available built-ins** | `commands` option to allowlist which built-ins are callable | No equivalent | Security hardening for untrusted scripts |
+| **AST transform plugin API** | `registerTransformPlugin()`, `transform()` — expose parsed AST | No AST exposure | Useful for analysis, fuzzing, and instrumentation |
+| **Browser / WASM support** | Runs in-browser via `browser.ts` entrypoint | Linux/macOS native only | Not a stated goal; out of scope for Go |
+| **AI SDK tool integration** | `bash-tool` wrapper for direct AI SDK use | No first-class AI tool adapter | Low-effort wrapper to add in Phase 9 |
+| **Portable sandbox API** | Vercel Sandbox-compatible interface for swapping backends | No portability layer | Allows upgrading to VM isolation transparently |
+| **Virtual process info** | `processInfo` option spoofs `$$`, `$UID`, `$HOSTNAME` | Real host PIDs/UIDs visible | Information disclosure risk for untrusted scripts |
+| **Per-exec `stdin`** | `stdin` per `exec()` call | Not exposed per-call | Minor gap; easy to add to `RunOptions` |
+| **Binary data handling** | Handles images/compressed files via latin1 encoding | Binary stdout behavior undocumented | Relevant for `cat` on binary files |
+| **Threat model document** | Comprehensive `THREAT_MODEL.md` with 65+ attack vectors and mitigations | None | Should be written after Phase 9 |
+
+---
+
+### 2. Planned in agentic-bash but not yet implemented
+
+| Phase | Feature | File | Status |
+|---|---|---|---|
+| Phase 8 | `SandboxPool` | `sandbox/pool.go` | Missing |
+| Phase 8 | `RunStream()` streaming output | `sandbox/sandbox.go` | Missing |
+| Phase 8 | `UploadTar` / `DownloadTar` batch file API | `sandbox/sandbox.go` | Missing |
+| Phase 8 | `Reset()` | `sandbox/sandbox.go` | Missing |
+| Phase 8 | OpenTelemetry integration | `sandbox/sandbox.go` | Missing |
+| Phase 9 | Cobra CLI (`run`, `shell`, `snapshot`, `restore`) | `main.go` | Missing (`main.go` is TUI-only) |
+| Phase 9 | Integration test suite | `integration/` | Missing |
+| Phase 5 | Seccomp BPF syscall filter | `internal/seccomp/filter.go` | Missing |
+
+---
+
+### 3. Fine-grained in-process execution limits
+
+just-bash enforces configurable limits **inside the interpreter**, per `exec()` call:
+
+- Max recursion / call depth
+- Max total command count per execution
+- Max loop iterations
+- Max heredoc size
+
+agentic-bash relies on wall-clock timeout + cgroupv2 memory/CPU (Linux-only). There are no per-call command/loop iteration counts enforced at the interpreter level. This means a tight infinite loop on macOS (where cgroups are unavailable) will spin indefinitely until the timeout fires.
+
+**Recommendation**: Add an `ExecutionLimits` sub-struct to `ResourceLimits` and wire it into the `mvdan.cc/sh` runner via a custom `interp.ExecHandler` counter.
+
+---
+
+### 4. Architectural note on session persistence
+
+The plan states that persistent shell state across `Run()` calls is "borrowed from just-bash." This is incorrect — just-bash actually **resets** env vars, cwd, and functions on each `exec()` call (only the filesystem persists across calls). agentic-bash's persistent session model is its **own design decision** and is a genuine differentiator. The rationale in the Key Design Decisions section should be updated to reflect this accurately.

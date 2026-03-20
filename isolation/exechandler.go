@@ -13,15 +13,17 @@ import (
 
 	"github.com/piyushsingariya/agentic-bash/internal/cgroups"
 	"github.com/piyushsingariya/agentic-bash/internal/limitwriter"
+	"github.com/piyushsingariya/agentic-bash/network"
 )
 
 // ExecLimits carries per-invocation resource limits injected at wireHandlers time.
 // Zero values disable the corresponding feature.
 type ExecLimits struct {
-	MaxOutputBytes int64          // combined stdout+stderr cap; 0 = no cap
+	MaxOutputBytes int64           // combined stdout+stderr cap; 0 = no cap
 	CgroupManager  cgroups.Manager // nil or unavailable = no cgroup
-	MaxMemoryBytes int64          // 0 = no limit (written to memory.max)
-	CPUQuota       float64        // 0 = no limit (0.5 = 50% of one CPU)
+	MaxMemoryBytes int64           // 0 = no limit (written to memory.max)
+	CPUQuota       float64         // 0 = no limit (0.5 = 50% of one CPU)
+	NetworkFilter  network.Filter  // nil = no network restrictions (Phase 7)
 }
 
 // ExecMetrics accumulates resource usage across all external commands spawned
@@ -100,6 +102,13 @@ func NewIsolatedExecHandler(strategy IsolationStrategy, limits ExecLimits, metri
 
 		if err := strategy.Wrap(cmd); err != nil {
 			return err
+		}
+
+		// Phase 7: apply network filter (e.g. CLONE_NEWNET for deny mode).
+		if limits.NetworkFilter != nil {
+			if err := limits.NetworkFilter.Wrap(cmd); err != nil {
+				return err
+			}
 		}
 
 		if err := cmd.Start(); err != nil {
