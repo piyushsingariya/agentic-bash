@@ -1,0 +1,20 @@
+# Keep the build context clean — only source code and module files are needed
+# by the builder stage. Everything below is excluded.
+
+.git
+.github
+
+# Local build artifacts
+agentic-bash
+*.test
+*.out
+
+# Dev/docs — not needed in the image
+plans/
+*.md
+!go.mod
+!go.sum
+
+# OS noise
+.DS_Store
+*.swp

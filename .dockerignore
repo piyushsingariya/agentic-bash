@@ -1,0 +1,19 @@
+.git
+.gitignore
+
+# compiled test binaries
+*.test
+
+# any locally compiled binary at the repo root
+/agentic-bash
+
+# scratch / temp
+/tmp
+
+# docs and plans don't affect the build
+/plans
+*.md
+
+# IDE configs
+.vscode
+.idea

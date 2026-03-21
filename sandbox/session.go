@@ -69,18 +69,19 @@ func newShellState(opts Options) *ShellState {
 // No host variables are inherited.
 func linuxBaseEnv(cfg BootstrapConfig, workDir string) map[string]string {
 	return map[string]string{
-		"HOME":     "/home/" + cfg.UserName,
-		"USER":     cfg.UserName,
-		"LOGNAME":  cfg.UserName,
-		"HOSTNAME": cfg.Hostname,
-		"SHELL":    "/bin/bash",
-		"TERM":     "xterm-256color",
-		"LANG":     "en_US.UTF-8",
-		"LC_ALL":   "en_US.UTF-8",
-		"PATH":     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"PWD":      workDir,
-		"OLDPWD":   workDir,
-		"TMPDIR":   "/tmp",
+		"HOME":              "/home/" + cfg.UserName,
+		"USER":              cfg.UserName,
+		"LOGNAME":           cfg.UserName,
+		"HOSTNAME":          cfg.Hostname,
+		"SHELL":             "/bin/bash",
+		"TERM":              "xterm-256color",
+		"LANG":              "en_US.UTF-8",
+		"LC_ALL":            "en_US.UTF-8",
+		"PATH":              "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"PWD":               workDir,
+		"OLDPWD":            workDir,
+		"TMPDIR":            "/tmp",
+		"AGENTIC_BASH_ENV":  "sandbox",
 	}
 }
 

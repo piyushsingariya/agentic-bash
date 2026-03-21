@@ -1,0 +1,7 @@
+PRETTY_NAME="agentic-bash VM (container)"
+NAME="agentic-bash-vm"
+ID=agentic-bash-vm
+ID_LIKE=ubuntu
+VERSION="1.0"
+HOME_URL="https://github.com/piyushsingariya/agentic-bash"
+AGENTIC_BASH_LAYER="container"

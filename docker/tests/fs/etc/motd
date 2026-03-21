@@ -1,0 +1,16 @@
+
+  ┌─────────────────────────────────────────────────────────┐
+  │              agentic-bash  ·  test container            │
+  ├─────────────────────────────────────────────────────────┤
+  │  Layer   : container (Docker)                           │
+  │  Env var : AGENTIC_BASH_ENV=container                   │
+  │                                                         │
+  │  To enter the virtual sandbox:                          │
+  │    $ agentic-bash shell                                 │
+  │    $ agentic-bash tui                                   │
+  │                                                         │
+  │  Layer check:                                           │
+  │    container  →  AGENTIC_BASH_ENV=container             │
+  │    sandbox    →  AGENTIC_BASH_ENV=sandbox               │
+  └─────────────────────────────────────────────────────────┘
+
