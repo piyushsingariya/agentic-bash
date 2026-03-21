@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/piyushsingariya/agentic-bash/executor"
+	"github.com/piyushsingariya/agentic-bash/executor/intercept"
 	sbfs "github.com/piyushsingariya/agentic-bash/fs"
 	"github.com/piyushsingariya/agentic-bash/internal/cgroups"
 	"github.com/piyushsingariya/agentic-bash/internal/pathmap"
@@ -304,21 +305,20 @@ func injectOverlayEnv(state *ShellState, overlayRoot string) {
 	}
 }
 
-// wireHandlers re-wires the exec handler to capture the current metrics
-// pointer.  Called from New() (after the open handler is set once) and the
-// start of each Run() so that a fresh *ExecMetrics is captured by the closure.
+// wireHandlers assembles the full handler chain on shellExec. Called from New()
+// and at the start of each Run() so that a fresh *ExecMetrics pointer is captured.
 func (s *Sandbox) wireHandlers() {
 	shellExec, ok := s.exec.(*executor.ShellExecutor)
 	if !ok {
 		return
 	}
 
-	// Phase 5: output cap for the in-process shell.
+	// Output cap for the in-process shell.
 	if s.opts.Limits.MaxOutputMB > 0 {
 		shellExec.WithOutputLimit(int64(s.opts.Limits.MaxOutputMB) * 1024 * 1024)
 	}
 
-	// Phase 7: select network filter based on sandbox network policy.
+	// Network filter.
 	var netFilter network.Filter
 	switch s.opts.Network.Mode {
 	case NetworkDeny:
@@ -336,23 +336,52 @@ func (s *Sandbox) wireHandlers() {
 		CPUQuota:       s.opts.Limits.MaxCPUPercent / 100.0,
 		NetworkFilter:  netFilter,
 	}
-	isoHandler := isolation.NewIsolatedExecHandler(s.isolation, limits, s.metrics)
-	shimCfg := packages.ShimConfig{
-		OverlayRoot: s.tempDir,
-		Manifest:    s.manifest,
-		CacheDir:    packages.DefaultCacheDir(),
-	}
-	shimHandler := packages.NewShimHandler(shimCfg, isoHandler)
-	// Process-info handler sits outermost so whoami/hostname/id/uname/ls are
-	// answered with virtual values before reaching the shim or isolation layers.
-	piCfg := executor.ProcessInfoConfig{
+
+	interceptCfg := intercept.Config{
 		UserName:    s.opts.Bootstrap.UserName,
 		Hostname:    s.opts.Bootstrap.Hostname,
 		UID:         s.opts.Bootstrap.UID,
 		GID:         s.opts.Bootstrap.GID,
 		SandboxRoot: s.tempDir,
 	}
-	shellExec.WithExecHandler(executor.NewProcessInfoHandler(piCfg, shimHandler))
+
+	shimCfg := packages.ShimConfig{
+		OverlayRoot: s.tempDir,
+		Manifest:    s.manifest,
+		CacheDir:    packages.DefaultCacheDir(),
+	}
+
+	// ExecHandlers middleware chain (outermost → innermost):
+	//   1. Audit       — logs every external command spawn
+	//   2. Dispatcher  — virtual command shims (sysinfo, filesystem, env)
+	//   3. Shim        — package manager interception (pip, apt)
+	//   4. Isolation   — resource limits + process isolation (terminal)
+	allInterceptors := append(
+		append(
+			intercept.NewSysInfoInterceptors(interceptCfg),
+			intercept.NewFilesystemInterceptors(interceptCfg)...,
+		),
+		intercept.NewEnvInterceptors(interceptCfg)...,
+	)
+	shellExec.WithExecMiddlewares(
+		intercept.NewAuditMiddleware(s.opts.AuditWriter),
+		intercept.NewDispatcher(allInterceptors...),
+		packages.NewShimMiddleware(shimCfg),
+		isolation.NewIsolatedExecMiddleware(s.isolation, limits, s.metrics),
+	)
+
+	// CallHandler: audit log + block list + virtual path arg rewriting.
+	shellExec.WithCallHandler(intercept.NewCallHandler(intercept.CallConfig{
+		AuditWriter: s.opts.AuditWriter,
+		BlockList:   s.opts.BlockList,
+		SandboxRoot: s.tempDir,
+	}))
+
+	// StatHandler: fixes [[ -f /virtual/path ]] and similar conditionals.
+	shellExec.WithStatHandler(intercept.NewStatHandler(s.tempDir))
+
+	// ReadDirHandler2: fixes glob expansion over virtual paths.
+	shellExec.WithReadDirHandler(intercept.NewReadDirHandler(s.tempDir))
 }
 
 // Reset restores the sandbox to its initial Options state.
@@ -364,6 +393,10 @@ func (s *Sandbox) Reset() {
 
 	// Clear files created during previous runs; keep the root directory.
 	_ = s.fs.Clear()
+	// Re-bootstrap the Linux skeleton so that /home/{user}, /etc, etc. exist
+	// again after Clear() wiped them. Without this, interp.New() fails to stat
+	// the working directory on the next Run().
+	_ = bootstrapFS(s.tempDir, s.opts.Bootstrap)
 	s.tracker.Reset()
 
 	if se, ok := s.exec.(executor.StateExtractor); ok {

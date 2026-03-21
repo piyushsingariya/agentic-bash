@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"io"
 	"time"
 
 	"github.com/piyushsingariya/agentic-bash/isolation"
@@ -119,6 +120,15 @@ type Options struct {
 	// BaseImageDir is the path to a pre-baked directory that forms the read-only
 	// lower layer of the sandbox filesystem (Phase 3). Empty disables layering.
 	BaseImageDir string
+
+	// AuditWriter receives a timestamped log line for every command invocation
+	// (including shell builtins) when non-nil. Format: [HH:MM:SS.mmm] call: <args>
+	AuditWriter io.Writer
+
+	// BlockList is a list of command patterns denied unconditionally.
+	// Each entry is prefix-matched against the full command+args joined by spaces.
+	// Example: []string{"rm -rf /", "mkfs", "dd if=/dev/"}
+	BlockList []string
 
 	// Hooks — called synchronously on the goroutine that invoked Run().
 	OnCommand   func(cmd string)

@@ -60,8 +60,11 @@ type ShellExecutor struct {
 	initDir string
 
 	// Optional hook points (nil = default OS behaviour).
-	execHandler ExecHandlerFunc
-	openHandler OpenHandlerFunc
+	execMiddlewares []func(next ExecHandlerFunc) ExecHandlerFunc
+	openHandler     OpenHandlerFunc
+	callHandler     interp.CallHandlerFunc
+	statHandler     interp.StatHandlerFunc
+	readDirHandler  interp.ReadDirHandlerFunc2
 
 	// outputLimitBytes caps combined stdout+stderr per Run(); 0 = no cap.
 	outputLimitBytes int64
@@ -87,10 +90,34 @@ func NewShellExecutor(env []string, cwd string) *ShellExecutor {
 	}
 }
 
-// WithExecHandler replaces the default OS exec with a custom handler.
-// Intended for Phase 6 package-manager interception.
+// WithExecMiddlewares sets the ExecHandlers middleware chain applied on each Run().
+// Middlewares are chained first-to-last; the last one calls the real OS exec.
+func (e *ShellExecutor) WithExecMiddlewares(mws ...func(next ExecHandlerFunc) ExecHandlerFunc) {
+	e.execMiddlewares = mws
+}
+
+// WithExecHandler is a convenience wrapper that adapts a single ExecHandlerFunc
+// (legacy style) into the middleware chain. The handler is treated as terminal —
+// it must not call next.
 func (e *ShellExecutor) WithExecHandler(h ExecHandlerFunc) {
-	e.execHandler = h
+	e.execMiddlewares = []func(next ExecHandlerFunc) ExecHandlerFunc{
+		func(_ ExecHandlerFunc) ExecHandlerFunc { return h },
+	}
+}
+
+// WithCallHandler sets the CallHandlerFunc called for every command (incl. builtins).
+func (e *ShellExecutor) WithCallHandler(h interp.CallHandlerFunc) {
+	e.callHandler = h
+}
+
+// WithStatHandler sets the StatHandlerFunc used by shell conditionals ([[ -f path ]]).
+func (e *ShellExecutor) WithStatHandler(h interp.StatHandlerFunc) {
+	e.statHandler = h
+}
+
+// WithReadDirHandler sets the ReadDirHandlerFunc2 used during glob expansion.
+func (e *ShellExecutor) WithReadDirHandler(h interp.ReadDirHandlerFunc2) {
+	e.readDirHandler = h
 }
 
 // WithOpenHandler replaces the default OS file open with a custom handler.
@@ -166,8 +193,17 @@ func (e *ShellExecutor) runCore(ctx context.Context, cmd string, outW, errW io.W
 	if e.dir != "" {
 		opts = append(opts, interp.Dir(e.dir))
 	}
-	if e.execHandler != nil {
-		opts = append(opts, interp.ExecHandler(e.execHandler))
+	if len(e.execMiddlewares) > 0 {
+		opts = append(opts, interp.ExecHandlers(e.execMiddlewares...))
+	}
+	if e.callHandler != nil {
+		opts = append(opts, interp.CallHandler(e.callHandler))
+	}
+	if e.statHandler != nil {
+		opts = append(opts, interp.StatHandler(e.statHandler))
+	}
+	if e.readDirHandler != nil {
+		opts = append(opts, interp.ReadDirHandler2(e.readDirHandler))
 	}
 	if e.openHandler != nil {
 		opts = append(opts, interp.OpenHandler(e.openHandler))

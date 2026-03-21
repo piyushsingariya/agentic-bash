@@ -44,6 +44,14 @@ func NewShimHandler(cfg ShimConfig, next interp.ExecHandlerFunc) interp.ExecHand
 	}
 }
 
+// NewShimMiddleware returns an ExecHandlers-compatible middleware that intercepts
+// pip and apt-get commands, forwarding everything else to next.
+func NewShimMiddleware(cfg ShimConfig) func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return NewShimHandler(cfg, next)
+	}
+}
+
 // OverlayPythonPath returns the Python site-packages directory inside the
 // overlay.  This path is injected as PYTHONPATH at sandbox creation so that
 // packages installed via pip are immediately importable.

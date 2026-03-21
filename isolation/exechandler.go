@@ -154,6 +154,17 @@ func NewIsolatedExecHandler(strategy IsolationStrategy, limits ExecLimits, metri
 	}
 }
 
+// NewIsolatedExecMiddleware returns an ExecHandlers-compatible middleware that
+// applies the same isolation, resource limits, and metrics as NewIsolatedExecHandler.
+// The next parameter is ignored — this middleware is always terminal: it spawns
+// the real process and never delegates further. The DefaultExecHandler appended
+// by interp.ExecHandlers is therefore unreachable when this middleware is present.
+func NewIsolatedExecMiddleware(strategy IsolationStrategy, limits ExecLimits, metrics *ExecMetrics) func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(_ interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return NewIsolatedExecHandler(strategy, limits, metrics)
+	}
+}
+
 // toExitStatus converts a cmd.Wait error into the interp exit-status type that
 // mvdan.cc/sh understands.  Non-exit errors are returned verbatim.
 func toExitStatus(err error) error {

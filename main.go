@@ -222,7 +222,7 @@ func runREPL(sb *sandbox.Sandbox) error {
 
 	fmt.Printf("agentic-bash shell  (isolation=%s, workdir=%s)\n",
 		sb.Isolation().Name(), sb.State().Cwd)
-	fmt.Print("Type commands, %reset, %snapshot <file>, %restore <file>, or Ctrl-D to exit.\n")
+	fmt.Println("Type commands, %reset, %snapshot <file>, %restore <file>, or Ctrl-D to exit.")
 
 	for {
 		line, err := rl.Readline()
