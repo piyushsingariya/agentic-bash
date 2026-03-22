@@ -13,7 +13,7 @@ import (
 // default (e.g. DNS resolution and loopback both succeed).
 func TestPhase7_AllowMode(t *testing.T) {
 	sb, err := sandbox.New(sandbox.Options{
-		Network: sandbox.NetworkPolicy{Mode: sandbox.NetworkAllow},
+		Network:      sandbox.NetworkPolicy{Mode: sandbox.NetworkAllow},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +35,7 @@ func TestPhase7_DenyModeLinux(t *testing.T) {
 	}
 
 	sb, err := sandbox.New(sandbox.Options{
-		Network: sandbox.NetworkPolicy{Mode: sandbox.NetworkDeny},
+		Network:      sandbox.NetworkPolicy{Mode: sandbox.NetworkDeny},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +62,7 @@ func TestPhase7_DenyModeLoopback(t *testing.T) {
 	}
 
 	sb, err := sandbox.New(sandbox.Options{
-		Network: sandbox.NetworkPolicy{Mode: sandbox.NetworkDeny},
+		Network:      sandbox.NetworkPolicy{Mode: sandbox.NetworkDeny},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestPhase7_DenyModeDegradationNonLinux(t *testing.T) {
 	}
 
 	sb, err := sandbox.New(sandbox.Options{
-		Network: sandbox.NetworkPolicy{Mode: sandbox.NetworkDeny},
+		Network:      sandbox.NetworkPolicy{Mode: sandbox.NetworkDeny},
 	})
 	if err != nil {
 		t.Fatal(err)
