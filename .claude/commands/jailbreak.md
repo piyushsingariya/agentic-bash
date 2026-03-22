@@ -241,6 +241,35 @@ Ensure the /reports directory exists before writing (`mkdir -p /reports`).
 
 ---
 
+## Phase 6 — GitHub Issue
+
+After the report file is written, create a GitHub issue using the `gh` CLI with the full report as the body.
+
+**Steps:**
+
+1. Detect the remote repo: `gh repo view --json nameWithOwner -q .nameWithOwner`
+2. Build the issue title:
+   - If confirmed escapes exist: `[Security] Sandbox escape vulnerabilities found — <N> confirmed, <M> partial (<date>)`
+   - If no confirmed escapes: `[Security] Jailbreak audit completed — no escapes confirmed (<date>)`
+3. Create the issue with:
+   ```bash
+   gh issue create \
+     --title "<title>" \
+     --body "$(cat <report-file-path>)" \
+     --label "security" \
+     --label "bug"
+   ```
+   - If the `security` or `bug` labels don't exist yet, create them first:
+     ```bash
+     gh label create security --color "#e11d48" --description "Security vulnerability or audit"
+     gh label create bug --color "#d73a4a" --description "Something isn't working"
+     ```
+   - Ignore label creation errors if they already exist (add `|| true`)
+4. After the issue is created, print the issue URL to the user.
+5. If `gh` is not authenticated or the repo has no remote, warn the user and skip this step — do not fail the whole run.
+
+---
+
 ## Behavior Rules
 
 - **Never fabricate results** — only report what you actually observed
