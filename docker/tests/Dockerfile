@@ -12,9 +12,10 @@ RUN go mod download
 
 # Copy full source and build a static Linux binary.
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN mkdir -p /out && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" \
-    -o /out/agentic-bash ./...
+    -o /out/agentic-bash .
 
 # ─── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM ubuntu:24.04
@@ -33,7 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user for profiles 2 (sudoer) and 3 (locked).
-RUN useradd -m -u 1000 -s /bin/bash agent \
+# Ubuntu 24.04 ships with a default `ubuntu` user at UID 1000; remove it first.
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && useradd -m -u 1000 -s /bin/bash agent \
     && echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent \
     && chmod 0440 /etc/sudoers.d/agent
 

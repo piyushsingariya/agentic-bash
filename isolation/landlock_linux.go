@@ -78,7 +78,7 @@ func (l *LandlockStrategy) Apply() error {
 		unix.LANDLOCK_ACCESS_FS_MAKE_BLOCK |
 		unix.LANDLOCK_ACCESS_FS_MAKE_SYM
 
-	attr := unix.LandlockRulesetAttr{HandledAccessFs: accessFS}
+	attr := unix.LandlockRulesetAttr{Access_fs: accessFS}
 	attrSize := unsafe.Sizeof(attr)
 
 	rulesetFD, _, errno := unix.Syscall(
@@ -100,14 +100,14 @@ func (l *LandlockStrategy) Apply() error {
 		if p == "" {
 			continue
 		}
-		f, err := os.OpenFile(p, os.O_PATH, 0)
+		f, err := os.OpenFile(p, unix.O_PATH, 0)
 		if err != nil {
 			continue // path doesn't exist on this system; skip
 		}
 
 		ruleAttr := unix.LandlockPathBeneathAttr{
-			AllowedAccess: accessFS,
-			ParentFd:      int32(f.Fd()),
+			Allowed_access: accessFS,
+			Parent_fd:      int32(f.Fd()),
 		}
 		_, _, ruleErrno := unix.Syscall6(
 			unix.SYS_LANDLOCK_ADD_RULE,
