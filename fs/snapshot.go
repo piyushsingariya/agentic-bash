@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Snapshot serialises the contents of lfs.Root() into an in-memory tar
@@ -92,6 +93,11 @@ func Restore(lfs *LayeredFS, data []byte) error {
 		}
 
 		target := filepath.Join(root, hdr.Name)
+		// Zip-slip protection: reject tar entries that escape the sandbox root.
+		rel, relErr := filepath.Rel(root, target)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			return fmt.Errorf("restore: path traversal in snapshot entry %q", hdr.Name)
+		}
 		info := hdr.FileInfo()
 
 		if info.IsDir() {
