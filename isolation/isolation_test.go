@@ -113,17 +113,25 @@ func TestBestAvailable_FallsBackToNoopOnNonLinux(t *testing.T) {
 // ─── SelectStrategy ──────────────────────────────────────────────────────────
 
 func TestSelectStrategy_None(t *testing.T) {
-	// IsolationNone = 0
-	s := isolation.SelectStrategy(0)
+	s := isolation.SelectStrategy(isolation.IsolationNone)
 	if s.Name() != "noop" {
-		t.Errorf("want 'noop' for level 0, got %q", s.Name())
+		t.Errorf("want 'noop' for IsolationNone, got %q", s.Name())
+	}
+}
+
+func TestSelectStrategy_Auto(t *testing.T) {
+	// IsolationAuto is now the zero value; SelectStrategy(0) must return BestAvailable.
+	s := isolation.SelectStrategy(0)
+	if !s.Available() {
+		t.Errorf("SelectStrategy(0) returned unavailable strategy %q", s.Name())
 	}
 }
 
 func TestSelectStrategy_Unknown(t *testing.T) {
+	// Unknown levels fall back to BestAvailable (not noop) to favour safety.
 	s := isolation.SelectStrategy(99)
-	if s.Name() != "noop" {
-		t.Errorf("want 'noop' for unknown level, got %q", s.Name())
+	if !s.Available() {
+		t.Errorf("want available strategy for unknown level, got %q", s.Name())
 	}
 }
 

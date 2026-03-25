@@ -10,17 +10,33 @@ import "os/exec"
 type IsolationLevel int
 
 const (
-	// IsolationNone applies no OS-level isolation.
-	IsolationNone IsolationLevel = iota
+	// IsolationAuto is the zero value and the default. It selects the strongest
+	// isolation strategy available at runtime: Landlock on Linux 5.13+, namespace
+	// isolation on older Linux, and no-op on macOS/other platforms.
+	//
+	// Zero-value safety: Options{} without an explicit Isolation field gets IsolationAuto,
+	// ensuring library users receive the best available isolation by default.
+	IsolationAuto IsolationLevel = iota
 
-	// IsolationNamespace uses Linux mount/PID/user namespaces.
+	// IsolationNone applies no OS-level isolation. The sandbox provides only
+	// shell-level illusions (virtual paths, sysinfo spoofing, shim interception).
+	//
+	// SECURITY WARNING: IsolationNone provides ZERO process containment. Any
+	// external command that spawns child processes (python3, node, bash, etc.)
+	// runs those grandchild processes with full host filesystem access,
+	// bypassing all shims, block lists, and path rewriting. On Linux, prefer
+	// IsolationAuto. On macOS, use PythonRuntimeWASM for Python containment.
+	IsolationNone
+
+	// IsolationNamespace uses Linux mount/PID/user namespaces (CLONE_NEWNS etc.).
+	// All processes in the subtree — including grandchild processes spawned by
+	// language runtimes — share the namespace and are therefore contained.
 	IsolationNamespace
 
 	// IsolationLandlock uses the Landlock LSM (Linux 5.13+, no root required).
+	// Filesystem access rules apply to the calling process and all descendants,
+	// including grandchild processes.
 	IsolationLandlock
-
-	// IsolationAuto selects the strongest strategy available at runtime.
-	IsolationAuto
 )
 
 // IsolationStrategy describes a single isolation mechanism.
@@ -63,16 +79,16 @@ func BestAvailable() IsolationStrategy {
 // Unknown levels fall back to Noop.
 func SelectStrategy(level IsolationLevel) IsolationStrategy {
 	switch level {
+	case IsolationAuto:
+		return BestAvailable()
 	case IsolationNone:
 		return NewNoop()
 	case IsolationNamespace:
 		return newNamespace()
 	case IsolationLandlock:
 		return newLandlock()
-	case IsolationAuto:
-		return BestAvailable()
 	default:
-		return NewNoop()
+		return BestAvailable()
 	}
 }
 
