@@ -93,6 +93,26 @@ const (
 	EnvPresetEmpty
 )
 
+// PythonRuntimeMode controls how python3/python commands are executed.
+type PythonRuntimeMode int
+
+const (
+	// PythonRuntimeNative (default) uses the host python3 binary.
+	// The subprocess module works, but grandchild processes spawned by Python
+	// run outside the sandbox intercept chain and can access the host filesystem.
+	// On Linux, OS-level isolation (IsolationNamespace/Landlock) still contains
+	// grandchildren at the kernel level. On macOS, there is no containment.
+	PythonRuntimeNative PythonRuntimeMode = iota
+
+	// PythonRuntimeWASM runs Python inside a wazero WASI runtime.
+	// subprocess.run(), os.system(), and os.popen() all fail with ENOSYS —
+	// subprocess escape is impossible by WASI specification, on every platform.
+	// Filesystem access is scoped to the sandbox overlay.
+	// C extensions (numpy native code, etc.) cannot be loaded.
+	// Requires PythonWASMBytes to be set; obtain via packages.FetchPythonWASM().
+	PythonRuntimeWASM
+)
+
 // Options configures a Sandbox at creation time. All fields are optional;
 // zero values produce a working sandbox with sensible defaults.
 type Options struct {
@@ -129,6 +149,17 @@ type Options struct {
 	// Each entry is prefix-matched against the full command+args joined by spaces.
 	// Example: []string{"rm -rf /", "mkfs", "dd if=/dev/"}
 	BlockList []string
+
+	// PythonRuntime selects how python3/python commands execute.
+	// Defaults to PythonRuntimeNative.
+	// Set to PythonRuntimeWASM for hard subprocess containment without
+	// requiring OS-level isolation — effective on macOS and Linux.
+	PythonRuntime PythonRuntimeMode
+
+	// PythonWASMBytes is the raw bytes of a WASI-compiled python.wasm binary.
+	// Required when PythonRuntime == PythonRuntimeWASM; ignored otherwise.
+	// Obtain via packages.FetchPythonWASM() or embed your own build.
+	PythonWASMBytes []byte
 
 	// Hooks — called synchronously on the goroutine that invoked Run().
 	OnCommand   func(cmd string)

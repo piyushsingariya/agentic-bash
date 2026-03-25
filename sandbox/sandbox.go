@@ -33,19 +33,20 @@ const DefaultTimeout = 30 * time.Second
 // NativeExecutor (Phase 1 /bin/sh subprocess) is retained as a fallback and
 // is used automatically if no bash-compatible shell features are needed.
 type Sandbox struct {
-	opts      Options
-	state     *ShellState
-	exec      executor.Executor
-	fs        *sbfs.LayeredFS
-	tracker   *sbfs.ChangeTracker
-	isolation isolation.IsolationStrategy
-	cgroupMgr cgroups.Manager        // Phase 5: per-sandbox cgroup factory
-	metrics   *isolation.ExecMetrics // Phase 5: reset each Run(); read after
-	manifest  *packages.Manifest     // Phase 6: tracks installed packages
-	tempDir   string                 // owned exclusively; removed on Close()
-	closed    bool
-	ctx       context.Context    // base context; replaced via SetContext
-	cancelCtx context.CancelFunc // cancels ctx; called on Close
+	opts       Options
+	state      *ShellState
+	exec       executor.Executor
+	fs         *sbfs.LayeredFS
+	tracker    *sbfs.ChangeTracker
+	isolation  isolation.IsolationStrategy
+	cgroupMgr  cgroups.Manager        // Phase 5: per-sandbox cgroup factory
+	metrics    *isolation.ExecMetrics // Phase 5: reset each Run(); read after
+	manifest   *packages.Manifest     // Phase 6: tracks installed packages
+	pythonWASM *packages.PythonWASMShim // non-nil when PythonRuntimeWASM is set
+	tempDir    string                 // owned exclusively; removed on Close()
+	closed     bool
+	ctx        context.Context    // base context; replaced via SetContext
+	cancelCtx  context.CancelFunc // cancels ctx; called on Close
 }
 
 // New creates and initialises a Sandbox with the provided options.
@@ -117,21 +118,38 @@ func New(opts Options) (*Sandbox, error) {
 	// every external command spawned by the shell runs with isolation applied.
 	iso := isolation.SelectStrategy(opts.Isolation)
 
+	// Python WASM runtime: compile the module once at sandbox creation so that
+	// each Run() call can instantiate a fresh module cheaply.
+	var pythonWASM *packages.PythonWASMShim
+	if opts.PythonRuntime == PythonRuntimeWASM {
+		if len(opts.PythonWASMBytes) == 0 {
+			_ = os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("sandbox: PythonRuntimeWASM requires PythonWASMBytes (see packages.FetchPythonWASM)")
+		}
+		shim, shimErr := packages.NewPythonWASMShim(context.Background(), opts.PythonWASMBytes, tmpDir)
+		if shimErr != nil {
+			_ = os.RemoveAll(tmpDir)
+			return nil, fmt.Errorf("sandbox: init python wasm: %w", shimErr)
+		}
+		pythonWASM = shim
+	}
+
 	baseCtx, cancelCtx := context.WithCancel(context.Background())
 
 	s := &Sandbox{
-		opts:      opts,
-		state:     state,
-		isolation: iso,
-		exec:      shellExec,
-		fs:        lfs,
-		tracker:   tracker,
-		tempDir:   tmpDir,
-		cgroupMgr: cgroups.NewManager(), // Phase 5: no-op on non-Linux
-		metrics:   &isolation.ExecMetrics{},
-		manifest:  packages.NewManifest(), // Phase 6
-		ctx:       baseCtx,
-		cancelCtx: cancelCtx,
+		opts:       opts,
+		state:      state,
+		isolation:  iso,
+		exec:       shellExec,
+		fs:         lfs,
+		tracker:    tracker,
+		tempDir:    tmpDir,
+		cgroupMgr:  cgroups.NewManager(), // Phase 5: no-op on non-Linux
+		metrics:    &isolation.ExecMetrics{},
+		manifest:   packages.NewManifest(), // Phase 6
+		pythonWASM: pythonWASM,
+		ctx:        baseCtx,
+		cancelCtx:  cancelCtx,
 	}
 	// Wire the open handler once — s.tracker and s.tempDir are stable for the
 	// sandbox lifetime, so there is no need to re-wire it on every Run().
@@ -363,12 +381,19 @@ func (s *Sandbox) wireHandlers() {
 		),
 		intercept.NewEnvInterceptors(interceptCfg)...,
 	)
-	shellExec.WithExecMiddlewares(
+	middlewares := []func(next executor.ExecHandlerFunc) executor.ExecHandlerFunc{
 		intercept.NewAuditMiddleware(s.opts.AuditWriter),
 		intercept.NewDispatcher(allInterceptors...),
 		packages.NewShimMiddleware(shimCfg),
-		isolation.NewIsolatedExecMiddleware(s.isolation, limits, s.metrics),
-	)
+	}
+	// PythonRuntimeWASM: intercept python3/python after pip shim (which handles
+	// "python3 -m pip ...") so pip commands still redirect to the overlay while
+	// all other Python invocations run inside the WASI sandbox.
+	if s.pythonWASM != nil {
+		middlewares = append(middlewares, packages.NewPythonWASMMiddleware(s.pythonWASM))
+	}
+	middlewares = append(middlewares, isolation.NewIsolatedExecMiddleware(s.isolation, limits, s.metrics))
+	shellExec.WithExecMiddlewares(middlewares...)
 
 	// CallHandler: audit log + block list + virtual path arg rewriting.
 	shellExec.WithCallHandler(intercept.NewCallHandler(intercept.CallConfig{
@@ -418,6 +443,9 @@ func (s *Sandbox) Close() error {
 	s.closed = true
 	if s.cancelCtx != nil {
 		s.cancelCtx()
+	}
+	if s.pythonWASM != nil {
+		_ = s.pythonWASM.Close(context.Background())
 	}
 	return os.RemoveAll(s.tempDir)
 }
