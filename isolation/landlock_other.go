@@ -5,9 +5,12 @@ package isolation
 import "os/exec"
 
 // LandlockStrategy is not available on non-Linux platforms.
-type LandlockStrategy struct{}
+type LandlockStrategy struct {
+	sandboxRoot  string
+	allowedPaths []string
+}
 
-func newLandlock() IsolationStrategy { return &LandlockStrategy{} }
+func newLandlock(_ string) IsolationStrategy { return &LandlockStrategy{} }
 
 // NewLandlockStrategy returns an unavailable LandlockStrategy on non-Linux.
 func NewLandlockStrategy(_ ...string) *LandlockStrategy { return &LandlockStrategy{} }

@@ -116,7 +116,7 @@ func New(opts Options) (*Sandbox, error) {
 
 	// Phase 4: select isolation strategy and wire a custom ExecHandler so that
 	// every external command spawned by the shell runs with isolation applied.
-	iso := isolation.SelectStrategy(opts.Isolation)
+	iso := isolation.SelectStrategyWithRoot(opts.Isolation, tmpDir, opts.StrictNamespace)
 
 	// Python WASM runtime: compile the module once at sandbox creation so that
 	// each Run() call can instantiate a fresh module cheaply.
@@ -361,6 +361,7 @@ func (s *Sandbox) wireHandlers() {
 		UID:         s.opts.Bootstrap.UID,
 		GID:         s.opts.Bootstrap.GID,
 		SandboxRoot: s.tempDir,
+		SymlinkFunc: s.tracker.Symlink,
 	}
 
 	shimCfg := packages.ShimConfig{
@@ -555,6 +556,8 @@ func (s *Sandbox) ListFiles(dir string) ([]FileInfo, error) {
 // UploadTar extracts a tar archive from r into the sandbox filesystem.
 // Existing files are overwritten; the sandbox root is not wiped first.
 // Path traversal attempts (entries escaping the sandbox root) are rejected.
+// Symlink entries (tar.TypeSymlink) whose resolved target escapes the sandbox
+// root are also rejected.
 func (s *Sandbox) UploadTar(r io.Reader) error {
 	root := s.fs.Root()
 	tr := tar.NewReader(r)
@@ -571,35 +574,49 @@ func (s *Sandbox) UploadTar(r io.Reader) error {
 			return fmt.Errorf("upload tar: path escapes sandbox root: %s", hdr.Name)
 		}
 		info := hdr.FileInfo()
-		if info.IsDir() {
+		switch hdr.Typeflag {
+		case tar.TypeDir:
 			if err := os.MkdirAll(target, info.Mode()); err != nil {
 				return fmt.Errorf("upload tar: mkdir %s: %w", hdr.Name, err)
 			}
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return fmt.Errorf("upload tar: mkdir parent %s: %w", hdr.Name, err)
-		}
-		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
-		if err != nil {
-			return fmt.Errorf("upload tar: create %s: %w", hdr.Name, err)
-		}
-		if _, err := io.Copy(f, tr); err != nil {
+		case tar.TypeSymlink:
+			if !tarSymlinkWithinRoot(root, target, hdr.Linkname) {
+				return fmt.Errorf("upload tar: symlink target escapes sandbox root: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("upload tar: mkdir parent %s: %w", hdr.Name, err)
+			}
+			_ = os.Remove(target)
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return fmt.Errorf("upload tar: create symlink %s: %w", hdr.Name, err)
+			}
+		default:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("upload tar: mkdir parent %s: %w", hdr.Name, err)
+			}
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+			if err != nil {
+				return fmt.Errorf("upload tar: create %s: %w", hdr.Name, err)
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return fmt.Errorf("upload tar: write %s: %w", hdr.Name, err)
+			}
 			f.Close()
-			return fmt.Errorf("upload tar: write %s: %w", hdr.Name, err)
 		}
-		f.Close()
 	}
 	return nil
 }
 
 // DownloadTar writes a tar archive of the sandbox filesystem to w.
 // The archive paths are relative to the sandbox root.
+// Symlinks are preserved as tar.TypeSymlink entries; symlinks whose resolved
+// target escapes the sandbox root are skipped to prevent exfiltration.
 func (s *Sandbox) DownloadTar(w io.Writer) error {
 	root := s.fs.Root()
 	tw := tar.NewWriter(w)
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil {
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
 			return nil
 		}
 		rel, relErr := filepath.Rel(root, path)
@@ -607,6 +624,30 @@ func (s *Sandbox) DownloadTar(w io.Writer) error {
 			return relErr
 		}
 		if rel == "." {
+			return nil
+		}
+		info, infoErr := d.Info() // Lstat semantics — does not follow symlinks
+		if infoErr != nil {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, readErr := os.Readlink(path)
+			if readErr != nil {
+				return nil
+			}
+			if !tarSymlinkWithinRoot(root, path, target) {
+				return nil // skip escaping symlinks
+			}
+			hdr := &tar.Header{
+				Typeflag: tar.TypeSymlink,
+				Name:     rel,
+				Linkname: target,
+				ModTime:  info.ModTime(),
+				Mode:     int64(info.Mode()),
+			}
+			if writeErr := tw.WriteHeader(hdr); writeErr != nil {
+				return fmt.Errorf("download tar: write symlink header %s: %w", rel, writeErr)
+			}
 			return nil
 		}
 		hdr, hdrErr := tar.FileInfoHeader(info, "")
@@ -636,6 +677,19 @@ func (s *Sandbox) DownloadTar(w io.Writer) error {
 		return err
 	}
 	return tw.Close()
+}
+
+// tarSymlinkWithinRoot reports whether a symlink's resolved target stays within
+// root.  symlinkPath is the absolute real path of the symlink; linkname is the
+// stored target string (may be absolute or relative).
+func tarSymlinkWithinRoot(root, symlinkPath, linkname string) bool {
+	resolved := linkname
+	if !filepath.IsAbs(linkname) {
+		resolved = filepath.Join(filepath.Dir(symlinkPath), linkname)
+	}
+	resolved = filepath.Clean(resolved)
+	clean := filepath.Clean(root)
+	return resolved == clean || strings.HasPrefix(resolved, clean+string(filepath.Separator))
 }
 
 // resolvePath converts a user-supplied path to the real on-disk path.

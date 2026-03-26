@@ -19,13 +19,16 @@ import (
 // syscall level for the entire process tree.  Call Apply() from within a child
 // process (e.g., after a fork) to avoid restricting the parent.
 //
-// allowedPaths is the list of directories that may be read and written.
-// The sandbox tmpDir and /proc (needed by Go runtime) are always added.
+// sandboxRoot is automatically added to the allowlist when non-empty.
+// allowedPaths may specify additional directories to permit.
 type LandlockStrategy struct {
+	sandboxRoot  string
 	allowedPaths []string
 }
 
-func newLandlock() IsolationStrategy { return &LandlockStrategy{} }
+func newLandlock(sandboxRoot string) IsolationStrategy {
+	return &LandlockStrategy{sandboxRoot: sandboxRoot}
+}
 
 // NewLandlockStrategy creates a LandlockStrategy with explicit allowed paths.
 func NewLandlockStrategy(allowedPaths ...string) *LandlockStrategy {
@@ -92,9 +95,14 @@ func (l *LandlockStrategy) Apply() error {
 	}
 	defer syscall.Close(int(rulesetFD))
 
-	// Build the list of allowed paths: caller-supplied + essential system paths.
+	// Build the list of allowed paths: sandbox root + caller-supplied + minimal
+	// runtime essentials.  Broad host paths (/etc, /usr, /bin, /lib, /tmp) are
+	// intentionally NOT added; they defeat filesystem containment.
 	paths := append([]string{}, l.allowedPaths...)
-	paths = append(paths, "/proc", "/dev", "/usr", "/lib", "/lib64", "/bin", "/etc", "/tmp")
+	if l.sandboxRoot != "" {
+		paths = append(paths, l.sandboxRoot)
+	}
+	paths = append(paths, "/proc", "/dev")
 
 	for _, p := range paths {
 		if p == "" {

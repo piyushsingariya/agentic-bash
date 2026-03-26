@@ -161,6 +161,15 @@ type Options struct {
 	// Obtain via packages.FetchPythonWASM() or embed your own build.
 	PythonWASMBytes []byte
 
+	// StrictNamespace enables chroot inside CLONE_NEWNS so that subprocesses
+	// see sandboxRoot as /.  Symlinks pointing to absolute host paths therefore
+	// resolve within the sandbox rather than the real filesystem.
+	//
+	// Requires IsolationNamespace (or IsolationAuto selecting namespace) and a
+	// fully-populated BaseImageDir — all binaries the shell executes must exist
+	// inside the sandbox root.
+	StrictNamespace bool
+
 	// Hooks — called synchronously on the goroutine that invoked Run().
 	OnCommand   func(cmd string)
 	OnResult    func(r ExecutionResult)

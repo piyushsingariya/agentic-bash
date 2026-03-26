@@ -312,6 +312,34 @@ func TestRun_OnResultHook(t *testing.T) {
 	}
 }
 
+// TestRun_LnSymlinkRelativeEscapeBlocked verifies that `ln -s` with a relative
+// target that traverses above the sandbox root is rejected.
+func TestRun_LnSymlinkRelativeEscapeBlocked(t *testing.T) {
+	s := newSandbox(t, sandbox.Options{})
+
+	// ../../../../../../etc/passwd from /home/user traverses well above any
+	// sandbox temp root and resolves to the host /etc/passwd.
+	r := s.Run("ln -s ../../../../../../etc/passwd /home/user/hostlink")
+	if r.ExitCode == 0 {
+		t.Error("expected non-zero exit for relative symlink escaping sandbox root, got exit 0")
+	}
+}
+
+// TestRun_LnSymlinkInsideSandboxAllowed verifies that `ln -s` within the
+// sandbox succeeds.
+func TestRun_LnSymlinkInsideSandboxAllowed(t *testing.T) {
+	s := newSandbox(t, sandbox.Options{})
+
+	// Create a file and a symlink to it inside the sandbox.
+	r := s.Run("echo hello > /home/user/real.txt && ln -s /home/user/real.txt /home/user/link.txt && cat /home/user/link.txt")
+	if r.ExitCode != 0 {
+		t.Errorf("expected exit 0 for intra-sandbox symlink, got %d (stderr: %s)", r.ExitCode, r.Stderr)
+	}
+	if got := strings.TrimSpace(r.Stdout); got != "hello" {
+		t.Errorf("expected 'hello' through symlink, got %q", got)
+	}
+}
+
 // TestRun_StateAccessor verifies that State() reflects current session state.
 func TestRun_StateAccessor(t *testing.T) {
 	s := newSandbox(t, sandbox.Options{

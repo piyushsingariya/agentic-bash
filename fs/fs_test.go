@@ -280,6 +280,87 @@ func TestSnapshot_EmptyFS(t *testing.T) {
 	}
 }
 
+// ---- OsFS symlink containment -----------------------------------------------
+
+func TestOsFS_Symlink_AbsoluteEscape_Blocked(t *testing.T) {
+	root := t.TempDir()
+	ofs := sbfs.NewOsFS(root)
+
+	linkPath := root + "/hostlink"
+	err := ofs.Symlink("/etc/passwd", linkPath)
+	if err == nil {
+		t.Fatal("expected error creating symlink to /etc/passwd, got nil")
+	}
+}
+
+func TestOsFS_Symlink_RelativeEscape_Blocked(t *testing.T) {
+	root := t.TempDir()
+	ofs := sbfs.NewOsFS(root)
+
+	// Create deep directory so the relative escape needs several ../
+	if err := os.MkdirAll(root+"/home/user", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := root + "/home/user/link"
+	// ../../../etc/passwd goes above root
+	err := ofs.Symlink("../../../etc/passwd", linkPath)
+	if err == nil {
+		t.Fatal("expected error for relative symlink escaping sandbox root, got nil")
+	}
+}
+
+func TestOsFS_Symlink_ValidAbsolute_Allowed(t *testing.T) {
+	root := t.TempDir()
+	ofs := sbfs.NewOsFS(root)
+
+	// Create a real file inside the sandbox to link to.
+	if err := os.WriteFile(root+"/real.txt", []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := root + "/link.txt"
+	if err := ofs.Symlink(root+"/real.txt", linkPath); err != nil {
+		t.Fatalf("unexpected error for valid absolute symlink: %v", err)
+	}
+}
+
+func TestOsFS_Symlink_ValidRelative_Allowed(t *testing.T) {
+	root := t.TempDir()
+	ofs := sbfs.NewOsFS(root)
+
+	if err := os.WriteFile(root+"/target.txt", []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := root + "/link.txt"
+	if err := ofs.Symlink("target.txt", linkPath); err != nil {
+		t.Fatalf("unexpected error for valid relative symlink: %v", err)
+	}
+}
+
+func TestOsFS_ReadFile_ThroughSymlinkEscape_Blocked(t *testing.T) {
+	root := t.TempDir()
+
+	// Plant a symlink on disk that points outside the sandbox, bypassing
+	// OsFS.Symlink (simulates a symlink created before the fix or via another path).
+	linkPath := root + "/hostlink"
+	if err := os.Symlink("/etc/passwd", linkPath); err != nil {
+		t.Skip("cannot create raw symlink:", err)
+	}
+
+	ofs := sbfs.NewOsFS(root)
+	_, err := ofs.ReadFile(linkPath)
+	// The containment check in OsFS.check catches the cleaned path (the symlink
+	// itself is within root), but openat2InRoot (on Linux 5.6+) blocks the
+	// follow; on other platforms the path-only check passes but the read of the
+	// actual /etc/passwd content should be the OS's own permission enforcement.
+	// We only assert that the call does NOT silently succeed with host content.
+	if err == nil {
+		data, _ := ofs.ReadFile(linkPath)
+		if len(data) > 0 {
+			t.Error("ReadFile through escaping symlink returned content — sandbox escape active")
+		}
+	}
+}
+
 // ---- helpers ----------------------------------------------------------------
 
 func containsPath(paths []string, target string) bool {

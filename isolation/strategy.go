@@ -65,30 +65,45 @@ type IsolationStrategy interface {
 // that works on the current platform/kernel.  Priority order:
 //
 //	Landlock (Linux 5.13+) → Namespace (Linux) → Noop (all platforms)
-func BestAvailable() IsolationStrategy {
-	if ls := newLandlock(); ls.Available() {
+//
+// Prefer BestAvailableWithRoot for production sandbox use.
+func BestAvailable() IsolationStrategy { return BestAvailableWithRoot("", false) }
+
+// BestAvailableWithRoot is like BestAvailable but passes sandboxRoot to the
+// Landlock allowlist and enables chroot inside namespace isolation when
+// enableChroot is true.
+func BestAvailableWithRoot(sandboxRoot string, enableChroot bool) IsolationStrategy {
+	if ls := newLandlock(sandboxRoot); ls.Available() {
 		return ls
 	}
-	if ns := newNamespace(); ns.Available() {
+	if ns := newNamespace(sandboxRoot, enableChroot); ns.Available() {
 		return ns
 	}
 	return NewNoop()
 }
 
 // SelectStrategy returns the strategy that corresponds to the given level.
-// Unknown levels fall back to Noop.
+// Unknown levels fall back to Noop.  Prefer SelectStrategyWithRoot for
+// production sandbox use.
 func SelectStrategy(level IsolationLevel) IsolationStrategy {
+	return SelectStrategyWithRoot(level, "", false)
+}
+
+// SelectStrategyWithRoot is like SelectStrategy but configures the strategy
+// with sandboxRoot (added to Landlock allowlist; used as chroot root in
+// namespace mode when enableChroot is true).
+func SelectStrategyWithRoot(level IsolationLevel, sandboxRoot string, enableChroot bool) IsolationStrategy {
 	switch level {
 	case IsolationAuto:
-		return BestAvailable()
+		return BestAvailableWithRoot(sandboxRoot, enableChroot)
 	case IsolationNone:
 		return NewNoop()
 	case IsolationNamespace:
-		return newNamespace()
+		return newNamespace(sandboxRoot, enableChroot)
 	case IsolationLandlock:
-		return newLandlock()
+		return newLandlock(sandboxRoot)
 	default:
-		return BestAvailable()
+		return BestAvailableWithRoot(sandboxRoot, enableChroot)
 	}
 }
 

@@ -1,7 +1,10 @@
 package sbfs
 
 import (
+	"errors"
+	"fmt"
 	stdfs "io/fs"
+	"os"
 	"path/filepath"
 
 	"github.com/spf13/afero"
@@ -47,6 +50,8 @@ func (o *OsFS) ensureDir(name string) {
 }
 
 // OpenFile implements SandboxFS.
+// On Linux 5.6+ it uses openat2(2) with RESOLVE_IN_ROOT for TOCTOU-free
+// containment; on older kernels and macOS it falls back to afero.OsFs.
 func (o *OsFS) OpenFile(name string, flag int, perm stdfs.FileMode) (afero.File, error) {
 	if err := o.check(name); err != nil {
 		return nil, err
@@ -54,7 +59,32 @@ func (o *OsFS) OpenFile(name string, flag int, perm stdfs.FileMode) (afero.File,
 	if isWriteFlag(flag) {
 		o.ensureDir(name)
 	}
+	if f, err := openat2InRoot(o.root, name, flag, perm); err == nil {
+		return f, nil
+	} else if !errors.Is(err, errors.ErrUnsupported) {
+		return nil, err
+	}
+	// Fallback path (macOS / kernel < 5.6): resolve symlinks before opening.
+	if resolved, err := filepath.EvalSymlinks(name); err == nil {
+		if err := checkContainment(o.root, resolved); err != nil {
+			return nil, fmt.Errorf("%w: symlink target escapes sandbox root", stdfs.ErrPermission)
+		}
+	}
 	return o.afs.OpenFile(name, flag, perm)
+}
+
+// Symlink implements SandboxFS.
+// Both newname and the resolved target of oldname must remain within the
+// sandbox root; absolute targets are checked directly, relative targets are
+// resolved against filepath.Dir(newname) before the containment check.
+func (o *OsFS) Symlink(oldname, newname string) error {
+	if err := o.check(newname); err != nil {
+		return err
+	}
+	if err := checkSymlinkTarget(o.root, newname, oldname); err != nil {
+		return fmt.Errorf("%w: symlink target escapes sandbox root: %s", stdfs.ErrPermission, oldname)
+	}
+	return os.Symlink(oldname, newname)
 }
 
 // Stat implements SandboxFS.
@@ -104,6 +134,13 @@ func (o *OsFS) Rename(oldpath, newpath string) error {
 func (o *OsFS) ReadFile(name string) ([]byte, error) {
 	if err := o.check(name); err != nil {
 		return nil, err
+	}
+	// On platforms without openat2, resolve symlinks before opening to prevent
+	// a pre-planted symlink from escaping the sandbox root.
+	if resolved, err := filepath.EvalSymlinks(name); err == nil {
+		if err := checkContainment(o.root, resolved); err != nil {
+			return nil, fmt.Errorf("%w: symlink target escapes sandbox root", stdfs.ErrPermission)
+		}
 	}
 	return afero.ReadFile(o.afs, name)
 }

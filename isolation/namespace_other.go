@@ -5,9 +5,12 @@ package isolation
 import "os/exec"
 
 // NamespaceStrategy is not available on non-Linux platforms.
-type NamespaceStrategy struct{}
+type NamespaceStrategy struct {
+	sandboxRoot  string
+	enableChroot bool
+}
 
-func newNamespace() IsolationStrategy { return &NamespaceStrategy{} }
+func newNamespace(_ string, _ bool) IsolationStrategy { return &NamespaceStrategy{} }
 
 // NewNamespaceForTest returns a NamespaceStrategy; used in cross-platform tests.
 func NewNamespaceForTest() IsolationStrategy { return &NamespaceStrategy{} }
