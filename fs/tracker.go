@@ -148,3 +148,9 @@ func (c *ChangeTracker) WriteFile(name string, data []byte, perm stdfs.FileMode)
 func (c *ChangeTracker) ReadDir(name string) ([]stdfs.DirEntry, error) {
 	return c.inner.ReadDir(name)
 }
+
+// Symlink implements SandboxFS.
+func (c *ChangeTracker) Symlink(oldname, newname string) error {
+	c.recordWrite(newname)
+	return c.inner.Symlink(oldname, newname)
+}

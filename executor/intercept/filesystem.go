@@ -36,6 +36,7 @@ func NewFilesystemInterceptors(cfg Config) []Interceptor {
 		&headInterceptor{cfg: cfg},
 		&tailInterceptor{cfg: cfg},
 		&wcInterceptor{cfg: cfg},
+		&lnInterceptor{cfg: cfg},
 	}
 }
 
@@ -483,6 +484,87 @@ func printWcLine(w io.Writer, data []byte, name string, lines, words, bytes bool
 		parts = append(parts, name)
 	}
 	fmt.Fprintln(w, strings.Join(parts, " "))
+}
+
+// ─── ln ───────────────────────────────────────────────────────────────────────
+
+type lnInterceptor struct{ cfg Config }
+
+func (l *lnInterceptor) Name() string { return "ln" }
+func (l *lnInterceptor) Handle(ctx context.Context, args []string) error {
+	hc := interp.HandlerCtx(ctx)
+
+	symlink := false
+	force := false
+	var operands []string
+	for _, a := range args[1:] {
+		if strings.HasPrefix(a, "-") && len(a) > 1 && a != "--" {
+			for _, c := range a[1:] {
+				switch c {
+				case 's':
+					symlink = true
+				case 'f':
+					force = true
+				}
+			}
+		} else {
+			operands = append(operands, a)
+		}
+	}
+
+	if len(operands) < 2 {
+		fmt.Fprintln(hc.Stderr, "ln: missing file operand")
+		return interp.NewExitStatus(1)
+	}
+
+	// Last operand is the destination (file or directory).
+	targetArg := operands[len(operands)-1]
+	sources := operands[:len(operands)-1]
+	targetReal := resolveArg(hc, l.cfg.SandboxRoot, targetArg)
+
+	exitCode := uint8(0)
+	for _, src := range sources {
+		linkName := targetReal
+		if info, err := os.Lstat(targetReal); err == nil && info.IsDir() {
+			linkName = filepath.Join(targetReal, filepath.Base(src))
+		}
+
+		if force {
+			_ = os.Remove(linkName)
+		}
+
+		if symlink {
+			// Translate absolute virtual paths to real sandbox paths so the
+			// stored symlink target stays within the sandbox root on disk.
+			srcForLink := src
+			if filepath.IsAbs(src) {
+				srcForLink = pathmap.VirtualToReal(l.cfg.SandboxRoot, src)
+			}
+			var err error
+			if l.cfg.SymlinkFunc != nil {
+				err = l.cfg.SymlinkFunc(srcForLink, linkName)
+			} else {
+				err = os.Symlink(srcForLink, linkName)
+			}
+			if err != nil {
+				fmt.Fprintf(hc.Stderr, "ln: failed to create symbolic link %q: %v\n",
+					pathmap.RealToVirtual(l.cfg.SandboxRoot, linkName), err)
+				exitCode = 1
+			}
+		} else {
+			srcReal := resolveArg(hc, l.cfg.SandboxRoot, src)
+			if err := os.Link(srcReal, linkName); err != nil {
+				fmt.Fprintf(hc.Stderr, "ln: failed to create hard link %q: %v\n",
+					pathmap.RealToVirtual(l.cfg.SandboxRoot, linkName), err)
+				exitCode = 1
+			}
+		}
+	}
+
+	if exitCode != 0 {
+		return interp.NewExitStatus(exitCode)
+	}
+	return nil
 }
 
 // ─── shared helpers ───────────────────────────────────────────────────────────

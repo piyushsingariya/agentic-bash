@@ -5,6 +5,7 @@ package isolation
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 )
 
@@ -16,11 +17,22 @@ import (
 //   - CLONE_NEWNS    – mount namespace; the child cannot affect host mount points.
 //   - CLONE_NEWPID   – PID namespace; sandbox processes cannot signal host pids.
 //
+// When sandboxRoot is non-empty and enableChroot is true, each subprocess is
+// additionally chrooted into sandboxRoot so symlinks pointing to absolute host
+// paths resolve within the sandbox rather than the real filesystem.
+// Requires a fully-populated BaseImageDir (all executed binaries must exist
+// inside sandboxRoot).
+//
 // This strategy requires no root privileges on kernels that allow unprivileged
 // user-namespace creation (all major distros since ~2016).
-type NamespaceStrategy struct{}
+type NamespaceStrategy struct {
+	sandboxRoot  string
+	enableChroot bool
+}
 
-func newNamespace() IsolationStrategy { return &NamespaceStrategy{} }
+func newNamespace(sandboxRoot string, enableChroot bool) IsolationStrategy {
+	return &NamespaceStrategy{sandboxRoot: sandboxRoot, enableChroot: enableChroot}
+}
 
 // NewNamespaceForTest returns a NamespaceStrategy; used in cross-platform tests.
 func NewNamespaceForTest() IsolationStrategy { return &NamespaceStrategy{} }
@@ -49,6 +61,8 @@ func (n *NamespaceStrategy) Available() bool {
 
 // Wrap applies namespace Cloneflags and UID/GID mappings to cmd.
 // Must be called after initCmd() so that SysProcAttr already exists.
+// When enableChroot is true and sandboxRoot is set, the subprocess is also
+// chrooted into sandboxRoot so absolute symlinks cannot escape to the host.
 func (n *NamespaceStrategy) Wrap(cmd *exec.Cmd) error {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
@@ -67,6 +81,20 @@ func (n *NamespaceStrategy) Wrap(cmd *exec.Cmd) error {
 	cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
 		{ContainerID: 0, HostID: gid, Size: 1},
 	}
+
+	if n.enableChroot && n.sandboxRoot != "" {
+		cmd.SysProcAttr.Chroot = n.sandboxRoot
+		// Rewrite Dir to be relative to the new root.
+		if strings.HasPrefix(cmd.Dir, n.sandboxRoot) {
+			cmd.Dir = cmd.Dir[len(n.sandboxRoot):]
+			if cmd.Dir == "" {
+				cmd.Dir = "/"
+			}
+		} else {
+			cmd.Dir = "/"
+		}
+	}
+
 	return nil
 }
 

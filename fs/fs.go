@@ -46,6 +46,11 @@ type SandboxFS interface {
 
 	// ReadDir returns the sorted directory entries.
 	ReadDir(name string) ([]stdfs.DirEntry, error)
+
+	// Symlink creates a symbolic link at newname pointing to oldname.
+	// Both newname and the resolved target of oldname must remain within the
+	// sandbox root; attempts to escape are rejected with stdfs.ErrPermission.
+	Symlink(oldname, newname string) error
 }
 
 // containedBy reports whether path is root or a descendant of root.
@@ -63,6 +68,18 @@ func checkContainment(root, name string) error {
 		return fmt.Errorf("%w: path escapes sandbox root: %s", stdfs.ErrPermission, name)
 	}
 	return nil
+}
+
+// checkSymlinkTarget validates that a symlink's target does not escape root.
+// symlinkPath is the absolute real path of the symlink itself; target is the
+// link target string (may be absolute or relative).  Relative targets are
+// resolved against the symlink's parent directory before the containment check.
+func checkSymlinkTarget(root, symlinkPath, target string) error {
+	resolved := target
+	if !filepath.IsAbs(target) {
+		resolved = filepath.Join(filepath.Dir(symlinkPath), target)
+	}
+	return checkContainment(root, resolved)
 }
 
 // isWriteFlag reports whether flag contains any write-intent bit.

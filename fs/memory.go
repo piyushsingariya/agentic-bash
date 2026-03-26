@@ -3,6 +3,7 @@ package sbfs
 import (
 	stdfs "io/fs"
 	"path/filepath"
+	"syscall"
 
 	"github.com/spf13/afero"
 )
@@ -103,6 +104,13 @@ func (m *MemoryFS) WriteFile(name string, data []byte, perm stdfs.FileMode) erro
 		return err
 	}
 	return afero.WriteFile(m.afs, name, data, perm)
+}
+
+// Symlink implements SandboxFS.
+// MemoryFS is a purely in-memory store with no real filesystem backing, so
+// symlinks are not supported. Callers that need symlinks should use OsFS.
+func (m *MemoryFS) Symlink(_, _ string) error {
+	return syscall.ENOTSUP
 }
 
 // ReadDir implements SandboxFS.

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	stdfs "io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,12 +14,15 @@ import (
 // Snapshot serialises the contents of lfs.Root() into an in-memory tar
 // archive.  The archive can later be passed to Restore to reproduce the exact
 // same directory state.
+//
+// Symlinks are preserved as tar.TypeSymlink entries.  Symlinks whose resolved
+// target escapes the sandbox root are skipped to prevent exfiltration.
 func Snapshot(lfs *LayeredFS) ([]byte, error) {
 	root := lfs.Root()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(root, func(path string, d stdfs.DirEntry, err error) error {
 		if err != nil {
 			return nil // skip unreadable entries
 		}
@@ -29,6 +33,33 @@ func Snapshot(lfs *LayeredFS) ([]byte, error) {
 		}
 		if rel == "." {
 			return nil // skip root itself
+		}
+
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+
+		// Handle symlinks: emit a TypeSymlink header after validating the target.
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, readErr := os.Readlink(path)
+			if readErr != nil {
+				return nil
+			}
+			if !symlinkWithinRoot(root, path, target) {
+				return nil // skip escaping symlinks silently
+			}
+			hdr := &tar.Header{
+				Typeflag: tar.TypeSymlink,
+				Name:     rel,
+				Linkname: target,
+				ModTime:  info.ModTime(),
+				Mode:     int64(info.Mode()),
+			}
+			if writeErr := tw.WriteHeader(hdr); writeErr != nil {
+				return fmt.Errorf("snapshot: write symlink header %s: %w", path, writeErr)
+			}
+			return nil
 		}
 
 		hdr, hdrErr := tar.FileInfoHeader(info, "")
@@ -98,30 +129,56 @@ func Restore(lfs *LayeredFS, data []byte) error {
 		if relErr != nil || strings.HasPrefix(rel, "..") {
 			return fmt.Errorf("restore: path traversal in snapshot entry %q", hdr.Name)
 		}
-		info := hdr.FileInfo()
 
-		if info.IsDir() {
-			if mkErr := os.MkdirAll(target, info.Mode()); mkErr != nil {
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if mkErr := os.MkdirAll(target, hdr.FileInfo().Mode()); mkErr != nil {
 				return fmt.Errorf("restore: mkdir %s: %w", target, mkErr)
 			}
-			continue
-		}
 
-		if dir := filepath.Dir(target); dir != "" {
-			if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
-				return fmt.Errorf("restore: mkdir parent %s: %w", dir, mkErr)
+		case tar.TypeSymlink:
+			if !symlinkWithinRoot(root, target, hdr.Linkname) {
+				return fmt.Errorf("restore: symlink target escapes sandbox in entry %q", hdr.Name)
 			}
-		}
+			if dir := filepath.Dir(target); dir != "" {
+				if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+					return fmt.Errorf("restore: mkdir parent %s: %w", dir, mkErr)
+				}
+			}
+			_ = os.Remove(target) // replace any existing entry
+			if linkErr := os.Symlink(hdr.Linkname, target); linkErr != nil {
+				return fmt.Errorf("restore: create symlink %s: %w", target, linkErr)
+			}
 
-		f, openErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
-		if openErr != nil {
-			return fmt.Errorf("restore: create %s: %w", target, openErr)
-		}
-		if _, copyErr := io.Copy(f, tr); copyErr != nil {
+		default: // regular file
+			if dir := filepath.Dir(target); dir != "" {
+				if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+					return fmt.Errorf("restore: mkdir parent %s: %w", dir, mkErr)
+				}
+			}
+			f, openErr := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdr.FileInfo().Mode())
+			if openErr != nil {
+				return fmt.Errorf("restore: create %s: %w", target, openErr)
+			}
+			if _, copyErr := io.Copy(f, tr); copyErr != nil {
+				f.Close()
+				return fmt.Errorf("restore: write %s: %w", target, copyErr)
+			}
 			f.Close()
-			return fmt.Errorf("restore: write %s: %w", target, copyErr)
 		}
-		f.Close()
 	}
 	return nil
+}
+
+// symlinkWithinRoot reports whether a symlink's resolved target stays within
+// root.  symlinkPath is the absolute real path of the symlink; target is the
+// Linkname string (may be absolute or relative).
+func symlinkWithinRoot(root, symlinkPath, target string) bool {
+	resolved := target
+	if !filepath.IsAbs(target) {
+		resolved = filepath.Join(filepath.Dir(symlinkPath), target)
+	}
+	resolved = filepath.Clean(resolved)
+	clean := filepath.Clean(root)
+	return resolved == clean || strings.HasPrefix(resolved, clean+string(filepath.Separator))
 }

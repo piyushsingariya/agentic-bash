@@ -19,6 +19,11 @@ type Config struct {
 	UID         int    // e.g. 1000
 	GID         int    // e.g. 1000
 	SandboxRoot string // real on-disk temp dir root for virtual↔real translation
+
+	// SymlinkFunc is called by lnInterceptor to create a symlink.  When set,
+	// it replaces the bare os.Symlink call so the sandbox FS layer can validate
+	// and record the operation.  If nil, os.Symlink is used directly.
+	SymlinkFunc func(oldname, newname string) error
 }
 
 // Interceptor handles one external command by name.
